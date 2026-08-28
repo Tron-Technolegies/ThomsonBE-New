@@ -7,4 +7,30 @@ urlpatterns = [
     path("customers/<int:customer_id>/", views.view_single_customer, name="view_single_customer"),
     path("customers/<int:customer_id>/edit/", views.edit_customer, name="edit_customer"),
     path("customers/<int:customer_id>/delete/", views.delete_customer, name="delete_customer"),
+    
+    path("orders/", views.view_all_orders, name="view_all_orders"),
+    path("orders/stats/", views.get_order_stats, name="get_order_stats"),
+    path("orders/add/", views.add_order, name="add_order"),
+    path("orders/<int:order_id>/edit/", views.edit_order, name="edit_order"),
+    
+    path("daily-prices/", views.get_daily_prices, name="get_daily_prices"),
+    path("daily-prices/update/", views.update_daily_prices, name="update_daily_prices"),
+    
+    path("accounts/orders/", views.get_accounts_orders, name="get_accounts_orders"),
+    path("invoices/create/", views.create_invoice, name="create_invoice"),
+    path("invoices/", views.get_all_invoices, name="get_all_invoices"),
+
+    path("advances/", views.get_advances, name="get_advances"),
+    path("advances/record/", views.record_advance, name="record_advance"),
+    path("advances/balance/", views.get_advance_balances, name="get_advance_balances"),
+
+    path("dashboard/stats/", views.get_dashboard_stats, name="get_dashboard_stats"),
+    path("dashboard/charts/", views.get_dashboard_charts, name="get_dashboard_charts"),
+    path("dashboard/recent-orders/", views.get_recent_orders, name="get_recent_orders"),
+    
+    path("reports/sales/", views.get_sales_report, name="get_sales_report"),
+    path("reports/customers/", views.get_customer_purchase_report, name="get_customer_purchase_report"),
+
+    path("notifications/", views.get_notifications, name="get_notifications"),
+    path("notifications/read/", views.mark_notifications_read, name="mark_notifications_read"),
 ]

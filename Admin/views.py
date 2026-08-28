@@ -3,11 +3,13 @@ from django.shortcuts import render
 # Create your views here.
 import json
 
-from django.db.models import Q
+from django.db.models import Q, Sum, Count, F
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from datetime import datetime, date, timedelta
+import json
 
-from .models import Customer
+from .models import Customer, Order, DailyPrice, Invoice, AdvancePayment, Notification
 
 
 @csrf_exempt
@@ -241,6 +243,58 @@ def view_single_customer(request, customer_id):
             status=404
         )
 
+    invoices = Invoice.objects.filter(order__customer=customer).order_by('-created_at')
+    advances = AdvancePayment.objects.filter(customer=customer).order_by('-created_at')
+    
+    purchase_history = []
+    for inv in invoices:
+        purchase_history.append({
+            "invoice": inv.invoice_number,
+            "date": inv.created_at.strftime("%d %b %Y"),
+            "item": f"{inv.order.chicken_type.capitalize()} Chicken",
+            "weight": f"{float(inv.order.weight)} kg",
+            "amount": f"₹{float(inv.total_amount):,.2f}",
+            "status": inv.status
+        })
+        
+    transactions = []
+    for inv in invoices:
+        transactions.append({
+            "date_obj": inv.created_at,
+            "date": inv.created_at.strftime("%d %b %Y"),
+            "type": "Invoice Raised",
+            "reference": inv.invoice_number,
+            "mode": "—",
+            "amount": f"₹{float(inv.total_amount):,.2f}",
+            "amountColor": "text-gray-900"
+        })
+        if float(inv.advance_used) > 0:
+            transactions.append({
+                "date_obj": inv.created_at,
+                "date": inv.created_at.strftime("%d %b %Y"),
+                "type": "Payment Received",
+                "reference": inv.invoice_number,
+                "mode": "Advance Applied",
+                "amount": f"₹{float(inv.advance_used):,.2f}",
+                "amountColor": "text-green-500"
+            })
+            
+    for adv in advances:
+        transactions.append({
+            "date_obj": adv.created_at,
+            "date": adv.created_at.strftime("%d %b %Y"),
+            "type": "Advance Payment",
+            "reference": adv.advance_number,
+            "mode": adv.payment_method,
+            "amount": f"+₹{float(adv.amount):,.2f}",
+            "amountColor": "text-red-500"
+        })
+        
+    transactions.sort(key=lambda x: x['date_obj'], reverse=True)
+    for t in transactions:
+        t.pop('date_obj', None)
+        t['balance'] = "—"
+
     return JsonResponse(
         {
             "success": True,
@@ -256,7 +310,9 @@ def view_single_customer(request, customer_id):
                 "status": customer.status,
                 "address": customer.address,
                 "created_at": customer.created_at,
-                "updated_at": customer.updated_at
+                "updated_at": customer.updated_at,
+                "purchase_history": purchase_history,
+                "transaction_history": transactions
             }
         }
     )
@@ -440,3 +496,570 @@ def delete_customer(request, customer_id):
             "message": "Customer deleted successfully."
         }
     )
+
+@csrf_exempt
+def add_order(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"success": False, "message": "Invalid JSON data."}, status=400)
+
+    customer_id = data.get("customer_id")
+    delivery_date = data.get("delivery_date")
+    chicken_type = data.get("chicken_type")
+    weight = data.get("weight")
+    status = data.get("status", "Pending")
+    notes = data.get("notes", "")
+
+    if not customer_id or not delivery_date or not chicken_type or not weight:
+        return JsonResponse({"success": False, "message": "Missing required fields."}, status=400)
+
+    try:
+        customer = Customer.objects.get(id=customer_id)
+    except Customer.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+
+    order = Order.objects.create(
+        customer=customer,
+        delivery_date=delivery_date,
+        chicken_type=chicken_type,
+        weight=weight,
+        status=status,
+        notes=notes
+    )
+
+    return JsonResponse({
+        "success": True,
+        "message": "Order added successfully.",
+        "order": {
+            "id": order.id,
+            "order_number": order.order_number,
+            "customer": order.customer.customer_name,
+            "delivery_date": order.delivery_date,
+            "chicken_type": order.chicken_type,
+            "weight": order.weight,
+            "status": order.status,
+            "notes": order.notes,
+            "created_at": order.created_at,
+        }
+    }, status=201)
+
+def view_all_orders(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    orders = Order.objects.all().order_by("-created_at")
+    status = request.GET.get("status", "").strip()
+    date = request.GET.get("date", "").strip()
+
+    if status and status.lower() != "all":
+        orders = orders.filter(status__iexact=status)
+
+    if date:
+        orders = orders.filter(delivery_date=date)
+
+    order_list = []
+    for order in orders:
+        order_list.append({
+            "id": order.id,
+            "order_number": order.order_number,
+            "customer": order.customer.customer_name,
+            "customer_id": order.customer.id,
+            "delivery_date": order.delivery_date,
+            "chicken_type": order.chicken_type,
+            "weight": order.weight,
+            "status": order.status,
+            "notes": order.notes,
+            "created_at": order.created_at,
+        })
+
+    return JsonResponse({"success": True, "count": len(order_list), "orders": order_list})
+
+@csrf_exempt
+def edit_order(request, order_id):
+    if request.method != "PUT":
+        return JsonResponse({"success": False, "message": "PUT method required."}, status=405)
+
+    try:
+        order = Order.objects.get(id=order_id)
+    except Order.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"success": False, "message": "Invalid JSON data."}, status=400)
+
+    if "customer_id" in data:
+        try:
+            order.customer = Customer.objects.get(id=data["customer_id"])
+        except Customer.DoesNotExist:
+            return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+
+    if "delivery_date" in data:
+        order.delivery_date = data["delivery_date"]
+    if "chicken_type" in data:
+        order.chicken_type = data["chicken_type"]
+    if "weight" in data:
+        order.weight = data["weight"]
+    if "status" in data:
+        order.status = data["status"]
+    if "notes" in data:
+        order.notes = data["notes"]
+
+    order.save()
+
+    return JsonResponse({
+        "success": True,
+        "message": "Order updated successfully.",
+        "order": {
+            "id": order.id,
+            "order_number": order.order_number,
+            "customer": order.customer.customer_name,
+            "customer_id": order.customer.id,
+            "delivery_date": order.delivery_date,
+            "chicken_type": order.chicken_type,
+            "weight": order.weight,
+            "status": order.status,
+            "notes": order.notes,
+            "created_at": order.created_at,
+        }
+    })
+
+def get_order_stats(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    active_orders = Order.objects.exclude(status__in=['Delivered', 'Cancelled'])
+    active_count = active_orders.count()
+    total_weight = active_orders.aggregate(Sum('weight'))['weight__sum'] or 0
+    pending_orders = Order.objects.filter(status__iexact='Pending').count()
+    cutting_queue = Order.objects.filter(status__iexact='Cutting').count()
+    ready_pickup = Order.objects.filter(status__iexact='Ready').count()
+
+    return JsonResponse({
+        "success": True,
+        "stats": {
+            "active_orders": active_count,
+            "total_weight": float(total_weight),
+            "pending_orders": pending_orders,
+            "cutting_queue": cutting_queue,
+            "ready_pickup": ready_pickup
+        }
+    })
+
+# --- Daily Pricing APIs ---
+
+def get_daily_prices(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    today = date.today()
+    prices = DailyPrice.objects.filter(date=today)
+    
+    price_map = {p.chicken_type: float(p.price) for p in prices}
+    
+    return JsonResponse({
+        "success": True,
+        "date": today.strftime('%Y-%m-%d'),
+        "prices": price_map
+    })
+
+@csrf_exempt
+def update_daily_prices(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        prices_data = data.get('prices', {})
+        today = date.today()
+
+        updated_prices = {}
+        for c_type in dict(Order.CHICKEN_TYPE_CHOICES).keys():
+            if c_type in prices_data:
+                obj, created = DailyPrice.objects.update_or_create(
+                    date=today,
+                    chicken_type=c_type,
+                    defaults={'price': prices_data[c_type]}
+                )
+                updated_prices[c_type] = float(obj.price)
+
+        return JsonResponse({
+            "success": True,
+            "message": "Daily prices updated successfully.",
+            "prices": updated_prices
+        })
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+
+# --- Accounts/Invoice APIs ---
+
+def get_accounts_orders(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    # In accounts, we usually want to see orders that are Ready or Delivered, or maybe all
+    # The requirement is to generate invoices for orders.
+    # We will fetch orders with their invoice data if it exists.
+    orders = Order.objects.filter(status__in=['Ready', 'Delivered']).order_by('-created_at')
+
+    order_list = []
+    for order in orders:
+        invoice_data = None
+        if hasattr(order, 'invoice'):
+            invoice_data = {
+                "invoice_number": order.invoice.invoice_number,
+                "selling_price_per_kg": float(order.invoice.selling_price_per_kg),
+                "gst_amount": float(order.invoice.gst_amount),
+                "total_amount": float(order.invoice.total_amount),
+                "status": order.invoice.status,
+            }
+        
+        order_list.append({
+            "id": order.id,
+            "order_number": order.order_number,
+            "customer": order.customer.customer_name,
+            "delivery_date": order.delivery_date,
+            "chicken_type": order.chicken_type,
+            "weight": float(order.weight),
+            "status": order.status,
+            "invoice": invoice_data
+        })
+
+    return JsonResponse({"success": True, "orders": order_list})
+
+@csrf_exempt
+def create_invoice(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        order_id = data.get('order_id')
+        selling_price_per_kg = float(data.get('selling_price_per_kg', 0))
+        gst_amount = float(data.get('gst_amount', 0))
+        total_amount = float(data.get('total_amount', 0))
+
+        order = Order.objects.get(id=order_id)
+        customer = order.customer
+
+        # Calculate Customer's available advance balance
+        total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or 0
+        total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or 0
+        available_advance = float(total_advances) - float(total_used)
+
+        advance_to_use = 0
+        status = 'Unpaid'
+
+        if available_advance > 0:
+            if available_advance >= total_amount:
+                advance_to_use = total_amount
+                status = 'Paid'
+            else:
+                advance_to_use = available_advance
+                status = 'Partial'
+
+        invoice, created = Invoice.objects.update_or_create(
+            order=order,
+            defaults={
+                'selling_price_per_kg': selling_price_per_kg,
+                'gst_amount': gst_amount,
+                'total_amount': total_amount,
+                'advance_used': advance_to_use,
+                'status': status
+            }
+        )
+
+        return JsonResponse({
+            "success": True,
+            "message": "Invoice saved successfully.",
+            "invoice_number": invoice.invoice_number,
+            "status": invoice.status
+        })
+    except Order.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+
+# --- Advance APIs ---
+
+def get_advances(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    advances = AdvancePayment.objects.all().order_by('-created_at')
+    
+    data = []
+    for adv in advances:
+        data.append({
+            "id": adv.advance_number,
+            "customer": adv.customer.customer_name,
+            "amount": float(adv.amount),
+            "payment_method": adv.payment_method,
+            "reference_no": adv.reference_no,
+            "date": adv.created_at.strftime("%d %b %Y"),
+            "note": adv.note
+        })
+        
+    return JsonResponse({"success": True, "advances": data})
+
+@csrf_exempt
+def record_advance(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        customer_id = data.get('customer_id')
+        amount = data.get('amount')
+        payment_method = data.get('payment_method')
+        reference_no = data.get('reference_no', '')
+        note = data.get('note', '')
+
+        customer = Customer.objects.get(id=customer_id)
+        
+        adv = AdvancePayment.objects.create(
+            customer=customer,
+            amount=amount,
+            payment_method=payment_method,
+            reference_no=reference_no,
+            note=note
+        )
+
+        return JsonResponse({"success": True, "message": "Advance recorded", "advance_number": adv.advance_number})
+    except Customer.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+def get_advance_balances(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    customers = Customer.objects.all()
+    balances = []
+    
+    for customer in customers:
+        total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or 0
+        total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or 0
+        
+        if total_advances > 0:
+            total_advances = float(total_advances)
+            total_used = float(total_used)
+            balance = total_advances - total_used
+            percent = (total_used / total_advances) * 100 if total_advances > 0 else 0
+            
+            last_adv = AdvancePayment.objects.filter(customer=customer).order_by('-created_at').first()
+            last_tx = last_adv.created_at.strftime("%d %b %Y") if last_adv else "-"
+            
+            balances.append({
+                "customer_name": customer.customer_name,
+                "received": total_advances,
+                "consumed": total_used,
+                "balance": balance,
+                "percent": int(percent),
+                "last_tx": last_tx
+            })
+
+    return JsonResponse({"success": True, "balances": balances})
+
+def get_all_invoices(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    invoices = Invoice.objects.all().order_by('-created_at')
+    
+    data = []
+    for inv in invoices:
+        balance_due = float(inv.total_amount) - float(inv.advance_used)
+        
+        data.append({
+            "id": inv.invoice_number,
+            "customer": inv.order.customer.customer_name,
+            "date": inv.created_at.strftime("%d %b %Y"),
+            "amount": float(inv.order.weight * inv.selling_price_per_kg),
+            "tax": float(inv.gst_amount),
+            "total": float(inv.total_amount),
+            "advance_used": float(inv.advance_used),
+            "balance": balance_due,
+            "status": inv.status
+        })
+
+    return JsonResponse({"success": True, "invoices": data})
+
+
+# --- Dashboard & Reports APIs ---
+
+def get_dashboard_stats(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    # Calculate Total Revenue (Sum of all Paid/Partial Invoice total_amount)
+    total_revenue = Invoice.objects.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+    
+    # Calculate Total Orders
+    total_orders = Order.objects.count()
+    
+    # Calculate Total Customers
+    total_customers = Customer.objects.count()
+    
+    # Calculate Outstanding Balance (Sum of Invoice totals minus advance_used)
+    invoices = Invoice.objects.filter(status__in=["Unpaid", "Partial"])
+    outstanding_balance = 0
+    for inv in invoices:
+        outstanding_balance += float(inv.total_amount) - float(inv.advance_used)
+        
+    return JsonResponse({
+        "success": True,
+        "revenue": float(total_revenue),
+        "orders": total_orders,
+        "customers": total_customers,
+        "outstanding": float(outstanding_balance)
+    })
+
+def get_dashboard_charts(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    # Get last 7 days of sales for chart
+    today = date.today()
+    chart_data = []
+    
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        
+        # Revenue for this day
+        invs = Invoice.objects.filter(created_at__date=d)
+        rev = invs.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+        
+        # Orders for this day
+        ords = Order.objects.filter(order_date=d).count()
+        
+        chart_data.append({
+            "name": d.strftime("%d %b, %a"),
+            "revenue": float(rev),
+            "orders": ords
+        })
+        
+    return JsonResponse({"success": True, "chartData": chart_data})
+
+def get_recent_orders(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    orders = Order.objects.all().order_by('-created_at')[:5]
+    data = []
+    for order in orders:
+        data.append({
+            "id": order.order_number,
+            "customer": order.customer.customer_name,
+            "weight": float(order.weight),
+            "status": order.status,
+            "date": order.created_at.strftime("%d %b %Y, %I:%M %p")
+        })
+        
+    return JsonResponse({"success": True, "recent_orders": data})
+
+def get_sales_report(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    invoices = Invoice.objects.all().order_by('-created_at')
+    data = []
+    
+    for inv in invoices:
+        data.append({
+            "invoice_no": inv.invoice_number,
+            "date": inv.created_at.strftime("%d %b %Y"),
+            "customer": inv.order.customer.customer_name,
+            "amount": float(inv.total_amount),
+            "status": inv.status
+        })
+        
+    return JsonResponse({"success": True, "sales": data})
+
+def get_customer_purchase_report(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    customers = Customer.objects.all()
+    data = []
+    
+    for c in customers:
+        orders = Order.objects.filter(customer=c)
+        total_orders = orders.count()
+        total_weight = orders.aggregate(Sum('weight'))['weight__sum'] or 0
+        
+        invoices = Invoice.objects.filter(order__customer=c)
+        total_spent = invoices.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+        
+        data.append({
+            "customer": c.customer_name,
+            "phone": c.phone_number,
+            "total_orders": total_orders,
+            "total_weight": float(total_weight),
+            "total_spent": float(total_spent)
+        })
+        
+    return JsonResponse({"success": True, "customers_report": data})
+
+
+# --- Notifications APIs ---
+
+def get_notifications(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    # Check if we should seed dummy notifications if empty
+    if Notification.objects.count() == 0:
+        Notification.objects.create(type="order", title="New Order Received", description="ORD-2026-0187 from Raj Enterprises- 200kg Dressed Chicken")
+        Notification.objects.create(type="payment", title="Payment Received", description="Rs.45,000 received from Hotel Grand Palace via Bank Transfer")
+        Notification.objects.create(type="invoice", title="Invoice Generated", description="INV-2026-0092 generated for Suresh Kumar - Rs.33,250")
+        Notification.objects.create(type="alert", title="Low Advance Balance", description="Meena Stores advance balance is below Rs.2,000", is_read=True)
+    
+    notifs = Notification.objects.all().order_by('-created_at')
+    data = []
+    for n in notifs:
+        data.append({
+            "id": n.id,
+            "type": n.type,
+            "title": n.title,
+            "description": n.description,
+            "is_read": n.is_read,
+            "time": n.created_at.strftime("%I:%M %p, %d %b")
+        })
+        
+    return JsonResponse({"success": True, "notifications": data})
+
+@csrf_exempt
+def mark_notifications_read(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+        
+    Notification.objects.filter(is_read=False).update(is_read=True)
+    return JsonResponse({"success": True, "message": "All notifications marked as read."})
+
+def get_all_invoices(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    invoices = Invoice.objects.all().order_by('-created_at')
+    data = []
+    for i in invoices:
+        data.append({
+            "id": i.invoice_number,
+            "customer": i.order.customer.customer_name,
+            "date": i.created_at.strftime("%d %b %Y"),
+            "amount": float(i.total_amount - i.gst_amount),
+            "tax": float(i.gst_amount),
+            "total": float(i.total_amount),
+            "status": i.status
+        })
+        
+    return JsonResponse({"success": True, "invoices": data})
