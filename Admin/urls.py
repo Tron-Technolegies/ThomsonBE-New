@@ -33,4 +33,5 @@ urlpatterns = [
 
     path("notifications/", views.get_notifications, name="get_notifications"),
     path("notifications/read/", views.mark_notifications_read, name="mark_notifications_read"),
+    path("notifications/clear/", views.clear_notifications, name="clear_notifications"),
 ]

@@ -531,6 +531,13 @@ def add_order(request):
         notes=notes
     )
 
+    # Create Notification for Cutting Team
+    Notification.objects.create(
+        type="order",
+        title="New Order Received",
+        description=f"Order {order.order_number} from {customer.customer_name} has been placed."
+    )
+
     return JsonResponse({
         "success": True,
         "message": "Order added successfully.",
@@ -657,14 +664,22 @@ def get_daily_prices(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
-    today = date.today()
-    prices = DailyPrice.objects.filter(date=today)
+    target_date_str = request.GET.get("date")
+    if target_date_str:
+        try:
+            target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            target_date = date.today()
+    else:
+        target_date = date.today()
+        
+    prices = DailyPrice.objects.filter(date=target_date)
     
     price_map = {p.chicken_type: float(p.price) for p in prices}
     
     return JsonResponse({
         "success": True,
-        "date": today.strftime('%Y-%m-%d'),
+        "date": target_date.strftime('%Y-%m-%d'),
         "prices": price_map
     })
 
@@ -676,13 +691,21 @@ def update_daily_prices(request):
     try:
         data = json.loads(request.body)
         prices_data = data.get('prices', {})
-        today = date.today()
+        target_date_str = data.get('date')
+        
+        if target_date_str:
+            try:
+                target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                target_date = date.today()
+        else:
+            target_date = date.today()
 
         updated_prices = {}
         for c_type in dict(Order.CHICKEN_TYPE_CHOICES).keys():
             if c_type in prices_data:
                 obj, created = DailyPrice.objects.update_or_create(
-                    date=today,
+                    date=target_date,
                     chicken_type=c_type,
                     defaults={'price': prices_data[c_type]}
                 )
@@ -691,7 +714,8 @@ def update_daily_prices(request):
         return JsonResponse({
             "success": True,
             "message": "Daily prices updated successfully.",
-            "prices": updated_prices
+            "prices": updated_prices,
+            "date": target_date.strftime('%Y-%m-%d')
         })
     except Exception as e:
         return JsonResponse({"success": False, "message": str(e)}, status=400)
@@ -703,10 +727,11 @@ def get_accounts_orders(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
-    # In accounts, we usually want to see orders that are Ready or Delivered, or maybe all
-    # The requirement is to generate invoices for orders.
-    # We will fetch orders with their invoice data if it exists.
     orders = Order.objects.filter(status__in=['Ready', 'Delivered']).order_by('-created_at')
+
+    target_date = request.GET.get('date')
+    if target_date:
+        orders = orders.filter(delivery_date=target_date)
 
     order_list = []
     for order in orders:
@@ -775,6 +800,13 @@ def create_invoice(request):
             }
         )
 
+        if created:
+            Notification.objects.create(
+                type="invoice",
+                title="Invoice Generated",
+                description=f"Invoice {invoice.invoice_number} created for {customer.customer_name}."
+            )
+
         return JsonResponse({
             "success": True,
             "message": "Invoice saved successfully.",
@@ -794,6 +826,14 @@ def get_advances(request):
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
     advances = AdvancePayment.objects.all().order_by('-created_at')
+
+    start_date = request.GET.get('start_date')
+    end_date = request.GET.get('end_date')
+    
+    if start_date:
+        advances = advances.filter(created_at__date__gte=start_date)
+    if end_date:
+        advances = advances.filter(created_at__date__lte=end_date)
     
     data = []
     for adv in advances:
@@ -830,6 +870,12 @@ def record_advance(request):
             payment_method=payment_method,
             reference_no=reference_no,
             note=note
+        )
+
+        Notification.objects.create(
+            type="payment",
+            title="Advance Received",
+            description=f"Received ₹{amount} from {customer.customer_name}."
         )
 
         return JsonResponse({"success": True, "message": "Advance recorded", "advance_number": adv.advance_number})
@@ -874,6 +920,14 @@ def get_all_invoices(request):
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
     invoices = Invoice.objects.all().order_by('-created_at')
+
+    start_date = request.GET.get('start_date')
+    end_date = request.GET.get('end_date')
+    
+    if start_date:
+        invoices = invoices.filter(created_at__date__gte=start_date)
+    if end_date:
+        invoices = invoices.filter(created_at__date__lte=end_date)
     
     data = []
     for inv in invoices:
@@ -1016,13 +1070,6 @@ def get_notifications(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
         
-    # Check if we should seed dummy notifications if empty
-    if Notification.objects.count() == 0:
-        Notification.objects.create(type="order", title="New Order Received", description="ORD-2026-0187 from Raj Enterprises- 200kg Dressed Chicken")
-        Notification.objects.create(type="payment", title="Payment Received", description="Rs.45,000 received from Hotel Grand Palace via Bank Transfer")
-        Notification.objects.create(type="invoice", title="Invoice Generated", description="INV-2026-0092 generated for Suresh Kumar - Rs.33,250")
-        Notification.objects.create(type="alert", title="Low Advance Balance", description="Meena Stores advance balance is below Rs.2,000", is_read=True)
-    
     notifs = Notification.objects.all().order_by('-created_at')
     data = []
     for n in notifs:
@@ -1044,6 +1091,14 @@ def mark_notifications_read(request):
         
     Notification.objects.filter(is_read=False).update(is_read=True)
     return JsonResponse({"success": True, "message": "All notifications marked as read."})
+
+@csrf_exempt
+def clear_notifications(request):
+    if request.method != "DELETE":
+        return JsonResponse({"success": False, "message": "DELETE method required."}, status=405)
+        
+    Notification.objects.all().delete()
+    return JsonResponse({"success": True, "message": "All notifications cleared."})
 
 def get_all_invoices(request):
     if request.method != "GET":
