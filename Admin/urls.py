@@ -12,6 +12,7 @@ urlpatterns = [
     path("orders/stats/", views.get_order_stats, name="get_order_stats"),
     path("orders/add/", views.add_order, name="add_order"),
     path("orders/<int:order_id>/edit/", views.edit_order, name="edit_order"),
+    path("orders/<int:order_id>/pricing/", views.save_order_pricing, name="save_order_pricing"),
     
     path("daily-prices/", views.get_daily_prices, name="get_daily_prices"),
     path("daily-prices/update/", views.update_daily_prices, name="update_daily_prices"),
@@ -19,6 +20,8 @@ urlpatterns = [
     path("accounts/orders/", views.get_accounts_orders, name="get_accounts_orders"),
     path("invoices/create/", views.create_invoice, name="create_invoice"),
     path("invoices/", views.get_all_invoices, name="get_all_invoices"),
+    path("invoices/<int:invoice_id>/payments/add/", views.add_invoice_payment, name="add_invoice_payment"),
+    path("invoices/<int:invoice_id>/payments/", views.get_invoice_payments, name="get_invoice_payments"),
 
     path("advances/", views.get_advances, name="get_advances"),
     path("advances/record/", views.record_advance, name="record_advance"),
@@ -28,7 +31,6 @@ urlpatterns = [
     path("dashboard/charts/", views.get_dashboard_charts, name="get_dashboard_charts"),
     path("dashboard/recent-orders/", views.get_recent_orders, name="get_recent_orders"),
     
-    path("reports/sales/", views.get_sales_report, name="get_sales_report"),
     path("reports/customers/", views.get_customer_purchase_report, name="get_customer_purchase_report"),
 
     path("notifications/", views.get_notifications, name="get_notifications"),

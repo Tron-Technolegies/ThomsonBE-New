@@ -4,12 +4,14 @@ from django.shortcuts import render
 import json
 
 from django.db.models import Q, Sum, Count, F
+from django.db import transaction
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, date, timedelta
+from decimal import Decimal
 import json
 
-from .models import Customer, Order, DailyPrice, Invoice, AdvancePayment, Notification
+from .models import Customer, Order, OrderItem, DailyPrice, Invoice, InvoiceItem, AdvancePayment, Notification
 
 
 @csrf_exempt
@@ -507,29 +509,55 @@ def add_order(request):
     except json.JSONDecodeError:
         return JsonResponse({"success": False, "message": "Invalid JSON data."}, status=400)
 
+    from .models import OrderItem
+    
     customer_id = data.get("customer_id")
     delivery_date = data.get("delivery_date")
-    chicken_type = data.get("chicken_type")
-    weight = data.get("weight")
     status = data.get("status", "Pending")
     notes = data.get("notes", "")
 
-    if not customer_id or not delivery_date or not chicken_type or not weight:
+    # Legacy compatibility vs New multi-item
+    items = data.get("items")
+    chicken_type = data.get("chicken_type")
+    weight = data.get("weight")
+
+    if not customer_id or not delivery_date:
         return JsonResponse({"success": False, "message": "Missing required fields."}, status=400)
+
+    if items is None and not (chicken_type and weight):
+        return JsonResponse({"success": False, "message": "Missing items or legacy chicken_type/weight."}, status=400)
 
     try:
         customer = Customer.objects.get(id=customer_id)
     except Customer.DoesNotExist:
         return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
 
+    # Convert legacy format to items array if needed
+    if items is None:
+        items = [{"chicken_type": chicken_type, "weight": weight}]
+    
+    if len(items) == 0:
+        return JsonResponse({"success": False, "message": "Order must have at least one item."}, status=400)
+
+    # Legacy fields synchronization (using the first item)
+    first_item = items[0]
+
     order = Order.objects.create(
         customer=customer,
         delivery_date=delivery_date,
-        chicken_type=chicken_type,
-        weight=weight,
+        chicken_type=first_item.get("chicken_type"),
+        weight=first_item.get("weight"),
         status=status,
         notes=notes
     )
+    
+    # Create OrderItems
+    for item in items:
+        OrderItem.objects.create(
+            order=order,
+            chicken_type=item.get("chicken_type"),
+            weight=item.get("weight")
+        )
 
     # Create Notification for Cutting Team
     Notification.objects.create(
@@ -537,6 +565,9 @@ def add_order(request):
         title="New Order Received",
         description=f"Order {order.order_number} from {customer.customer_name} has been placed."
     )
+
+    # Build items response
+    items_response = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight)} for oi in order.items.all()]
 
     return JsonResponse({
         "success": True,
@@ -547,7 +578,8 @@ def add_order(request):
             "customer": order.customer.customer_name,
             "delivery_date": order.delivery_date,
             "chicken_type": order.chicken_type,
-            "weight": order.weight,
+            "weight": str(order.weight) if order.weight else "0",
+            "items": items_response,
             "status": order.status,
             "notes": order.notes,
             "created_at": order.created_at,
@@ -558,7 +590,7 @@ def view_all_orders(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
-    orders = Order.objects.all().order_by("-created_at")
+    orders = Order.objects.prefetch_related('items', 'customer').all().order_by("-created_at")
     status = request.GET.get("status", "").strip()
     date = request.GET.get("date", "").strip()
 
@@ -570,14 +602,16 @@ def view_all_orders(request):
 
     order_list = []
     for order in orders:
+        items_list = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight)} for oi in order.items.all()]
         order_list.append({
             "id": order.id,
             "order_number": order.order_number,
             "customer": order.customer.customer_name,
             "customer_id": order.customer.id,
             "delivery_date": order.delivery_date,
-            "chicken_type": order.chicken_type,
-            "weight": order.weight,
+            "chicken_type": order.chicken_type, # legacy
+            "weight": str(order.weight) if order.weight else "0", # legacy
+            "items": items_list,
             "status": order.status,
             "notes": order.notes,
             "created_at": order.created_at,
@@ -600,6 +634,8 @@ def edit_order(request, order_id):
     except json.JSONDecodeError:
         return JsonResponse({"success": False, "message": "Invalid JSON data."}, status=400)
 
+    from .models import OrderItem
+
     if "customer_id" in data:
         try:
             order.customer = Customer.objects.get(id=data["customer_id"])
@@ -608,16 +644,44 @@ def edit_order(request, order_id):
 
     if "delivery_date" in data:
         order.delivery_date = data["delivery_date"]
-    if "chicken_type" in data:
-        order.chicken_type = data["chicken_type"]
-    if "weight" in data:
-        order.weight = data["weight"]
     if "status" in data:
         order.status = data["status"]
     if "notes" in data:
         order.notes = data["notes"]
 
+    # Handle items / legacy dual-write
+    items = data.get("items")
+    chicken_type = data.get("chicken_type")
+    weight = data.get("weight")
+    
+    if items is not None:
+        if len(items) > 0:
+            order.chicken_type = items[0].get("chicken_type")
+            order.weight = items[0].get("weight")
+            # Replace existing items securely
+            order.items.all().delete()
+            for item in items:
+                OrderItem.objects.create(
+                    order=order,
+                    chicken_type=item.get("chicken_type"),
+                    weight=item.get("weight")
+                )
+    elif chicken_type or weight:
+        if chicken_type:
+            order.chicken_type = chicken_type
+        if weight:
+            order.weight = weight
+        # Only rewrite if items weren't provided to maintain legacy compatibility
+        order.items.all().delete()
+        OrderItem.objects.create(
+            order=order,
+            chicken_type=order.chicken_type,
+            weight=order.weight
+        )
+
     order.save()
+
+    items_response = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight)} for oi in order.items.all()]
 
     return JsonResponse({
         "success": True,
@@ -628,8 +692,9 @@ def edit_order(request, order_id):
             "customer": order.customer.customer_name,
             "customer_id": order.customer.id,
             "delivery_date": order.delivery_date,
-            "chicken_type": order.chicken_type,
-            "weight": order.weight,
+            "chicken_type": order.chicken_type, # legacy
+            "weight": str(order.weight) if order.weight else "0", # legacy
+            "items": items_response,
             "status": order.status,
             "notes": order.notes,
             "created_at": order.created_at,
@@ -640,9 +705,14 @@ def get_order_stats(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
+    from .models import OrderItem
+
     active_orders = Order.objects.exclude(status__in=['Delivered', 'Cancelled'])
     active_count = active_orders.count()
-    total_weight = active_orders.aggregate(Sum('weight'))['weight__sum'] or 0
+    
+    # Calculate total weight from OrderItem, not legacy Order.weight
+    total_weight = OrderItem.objects.filter(order__in=active_orders).aggregate(Sum('weight'))['weight__sum'] or 0
+    
     pending_orders = Order.objects.filter(status__iexact='Pending').count()
     cutting_queue = Order.objects.filter(status__iexact='Cutting').count()
     ready_pickup = Order.objects.filter(status__iexact='Ready').count()
@@ -727,7 +797,7 @@ def get_accounts_orders(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
-    orders = Order.objects.filter(status__in=['Ready', 'Delivered']).order_by('-created_at')
+    orders = Order.objects.filter(status__in=['Ready', 'Delivered']).prefetch_related('items', 'invoice').order_by('-created_at')
 
     target_date = request.GET.get('date')
     if target_date:
@@ -739,24 +809,60 @@ def get_accounts_orders(request):
         if hasattr(order, 'invoice'):
             invoice_data = {
                 "invoice_number": order.invoice.invoice_number,
-                "selling_price_per_kg": float(order.invoice.selling_price_per_kg),
-                "gst_amount": float(order.invoice.gst_amount),
+                "selling_price_per_kg": float(order.invoice.selling_price_per_kg) if order.invoice.selling_price_per_kg else 0, # legacy fallback
+                "gst_amount": float(order.invoice.gst_amount) if order.invoice.gst_amount else 0, # legacy fallback
                 "total_amount": float(order.invoice.total_amount),
                 "status": order.invoice.status,
             }
         
+        items_list = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight), "price_per_kg": float(oi.price_per_kg) if oi.price_per_kg else None} for oi in order.items.all()]
+
         order_list.append({
             "id": order.id,
             "order_number": order.order_number,
             "customer": order.customer.customer_name,
             "delivery_date": order.delivery_date,
-            "chicken_type": order.chicken_type,
-            "weight": float(order.weight),
+            "chicken_type": order.chicken_type, # legacy
+            "weight": str(order.weight) if order.weight else "0", # legacy
+            "items": items_list,
             "status": order.status,
             "invoice": invoice_data
         })
 
     return JsonResponse({"success": True, "orders": order_list})
+
+@csrf_exempt
+def save_order_pricing(request, order_id):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        order = Order.objects.get(id=order_id)
+        data = json.loads(request.body)
+        
+        items_data = data.get('items', [])
+        
+        if not items_data:
+            return JsonResponse({"success": False, "message": "Items pricing data is required."}, status=400)
+            
+        for item_data in items_data:
+            item_id = item_data.get('id')
+            price_per_kg = item_data.get('price_per_kg')
+            
+            if item_id and price_per_kg is not None:
+                try:
+                    order_item = OrderItem.objects.get(id=item_id, order=order)
+                    order_item.price_per_kg = float(price_per_kg)
+                    order_item.save()
+                except OrderItem.DoesNotExist:
+                    continue
+                    
+        return JsonResponse({"success": True, "message": "Pricing saved successfully."})
+        
+    except Order.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
 
 @csrf_exempt
 def create_invoice(request):
@@ -766,55 +872,134 @@ def create_invoice(request):
     try:
         data = json.loads(request.body)
         order_id = data.get('order_id')
-        selling_price_per_kg = float(data.get('selling_price_per_kg', 0))
-        gst_amount = float(data.get('gst_amount', 0))
-        total_amount = float(data.get('total_amount', 0))
+        gst_type = data.get('gst_type', 'fixed')
+        gst_input_val = data.get('gst_input', 0)
+        
+        try:
+            gst_input = Decimal(str(gst_input_val))
+        except (ValueError, TypeError, Exception):
+            gst_input = Decimal('0.00')
 
-        order = Order.objects.get(id=order_id)
-        customer = order.customer
+        if not order_id:
+            return JsonResponse({"success": False, "message": "order_id is required."}, status=400)
 
-        # Calculate Customer's available advance balance
-        total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or 0
-        total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or 0
-        available_advance = float(total_advances) - float(total_used)
+        with transaction.atomic():
+            # Validate Order
+            order = Order.objects.select_for_update().get(id=order_id)
+            
+            # Lock the customer to prevent concurrent advance consumption
+            customer = Customer.objects.select_for_update().get(id=order.customer_id)
+            
+            # Duplicate protection
+            if hasattr(order, 'invoice'):
+                return JsonResponse({"success": False, "message": "Invoice already exists for this order."}, status=400)
 
-        advance_to_use = 0
-        status = 'Unpaid'
+            items = order.items.all()
+            if not items.exists():
+                return JsonResponse({"success": False, "message": "Order has no items."}, status=400)
 
-        if available_advance > 0:
-            if available_advance >= total_amount:
-                advance_to_use = total_amount
-                status = 'Paid'
+            # Validate prices and calculate subtotal using Decimal
+            subtotal = Decimal('0.00')
+            for item in items:
+                if item.price_per_kg is None or Decimal(str(item.price_per_kg)) < Decimal('0.00'):
+                    return JsonResponse({"success": False, "message": f"Missing or invalid price for item: {item.chicken_type}"}, status=400)
+                if item.weight is None or Decimal(str(item.weight)) <= Decimal('0.00'):
+                    return JsonResponse({"success": False, "message": f"Invalid weight for item: {item.chicken_type}"}, status=400)
+                
+                item_subtotal = Decimal(str(item.weight)) * Decimal(str(item.price_per_kg))
+                subtotal += item_subtotal
+
+            # Quantize subtotal to 2 decimal places
+            subtotal = subtotal.quantize(Decimal('0.01'))
+
+            # Calculate GST using Decimal
+            if gst_type == 'percentage':
+                calculated_gst_amount = subtotal * (gst_input / Decimal('100.00'))
             else:
-                advance_to_use = available_advance
-                status = 'Partial'
+                calculated_gst_amount = gst_input
+                
+            calculated_gst_amount = calculated_gst_amount.quantize(Decimal('0.01'))
 
-        invoice, created = Invoice.objects.update_or_create(
-            order=order,
-            defaults={
-                'selling_price_per_kg': selling_price_per_kg,
-                'gst_amount': gst_amount,
-                'total_amount': total_amount,
-                'advance_used': advance_to_use,
-                'status': status
-            }
-        )
+            total_amount = subtotal + calculated_gst_amount
 
-        if created:
+            # Calculate Customer's available advance balance
+            total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or Decimal('0.00')
+            total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or Decimal('0.00')
+            available_advance = Decimal(str(total_advances)) - Decimal(str(total_used))
+
+            advance_to_use = Decimal('0.00')
+            status = 'Unpaid'
+
+            if available_advance > Decimal('0.00'):
+                if available_advance >= total_amount:
+                    advance_to_use = total_amount
+                    status = 'Paid'
+                else:
+                    advance_to_use = available_advance
+                    status = 'Partial'
+
+            # Create Invoice
+            invoice = Invoice.objects.create(
+                order=order,
+                gst_type=gst_type,
+                gst_input=gst_input,
+                calculated_gst_amount=calculated_gst_amount,
+                total_amount=total_amount,
+                advance_used=advance_to_use,
+                status=status,
+                # Legacy fields for compatibility
+                selling_price_per_kg=Decimal('0.00'), 
+                gst_amount=calculated_gst_amount
+            )
+
+            # Create InvoiceItem snapshots
+            invoice_items_data = []
+            for item in items:
+                ii = InvoiceItem.objects.create(
+                    invoice=invoice,
+                    order_item=item,
+                    chicken_type_snapshot=item.chicken_type,
+                    weight_snapshot=item.weight,
+                    selling_price_per_kg_snapshot=item.price_per_kg
+                )
+                item_subtotal = Decimal(str(ii.weight_snapshot)) * Decimal(str(ii.selling_price_per_kg_snapshot))
+                invoice_items_data.append({
+                    "chicken_type": ii.chicken_type_snapshot,
+                    "weight": str(ii.weight_snapshot),
+                    "selling_price_per_kg": str(ii.selling_price_per_kg_snapshot),
+                    "subtotal": float(item_subtotal.quantize(Decimal('0.01')))
+                })
+
+            # The Notification model from the existing codebase expects 'type', 'title', 'description'
             Notification.objects.create(
                 type="invoice",
                 title="Invoice Generated",
                 description=f"Invoice {invoice.invoice_number} created for {customer.customer_name}."
             )
 
-        return JsonResponse({
-            "success": True,
-            "message": "Invoice saved successfully.",
-            "invoice_number": invoice.invoice_number,
-            "status": invoice.status
-        })
+            remaining_amount = total_amount - advance_to_use
+
+            response_data = {
+                "id": invoice.id,
+                "invoice_number": invoice.invoice_number,
+                "order_id": order.id,
+                "items": invoice_items_data,
+                "subtotal": float(subtotal),
+                "gst_type": gst_type,
+                "gst_input": float(gst_input),
+                "calculated_gst_amount": float(calculated_gst_amount),
+                "total_amount": float(total_amount),
+                "advance_used": float(advance_to_use),
+                "remaining_amount": float(remaining_amount),
+                "status": status
+            }
+
+            return JsonResponse({"success": True, "invoice": response_data})
+
     except Order.DoesNotExist:
         return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+    except Customer.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
     except Exception as e:
         return JsonResponse({"success": False, "message": str(e)}, status=400)
 
@@ -919,7 +1104,7 @@ def get_all_invoices(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
-    invoices = Invoice.objects.all().order_by('-created_at')
+    invoices = Invoice.objects.all().prefetch_related('payments').order_by('-created_at')
 
     start_date = request.GET.get('start_date')
     end_date = request.GET.get('end_date')
@@ -931,14 +1116,14 @@ def get_all_invoices(request):
     
     data = []
     for inv in invoices:
-        balance_due = float(inv.total_amount) - float(inv.advance_used)
+        balance_due = float(inv.remaining_amount)
         
         data.append({
             "id": inv.invoice_number,
             "customer": inv.order.customer.customer_name,
             "date": inv.created_at.strftime("%d %b %Y"),
-            "amount": float(inv.order.weight * inv.selling_price_per_kg),
-            "tax": float(inv.gst_amount),
+            "amount": float(inv.total_amount - inv.calculated_gst_amount),
+            "tax": float(inv.calculated_gst_amount),
             "total": float(inv.total_amount),
             "advance_used": float(inv.advance_used),
             "balance": balance_due,
@@ -946,6 +1131,92 @@ def get_all_invoices(request):
         })
 
     return JsonResponse({"success": True, "invoices": data})
+
+@csrf_exempt
+def add_invoice_payment(request, invoice_id):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        amount_val = data.get('amount')
+        payment_method = data.get('payment_method', 'Cash')
+        reference_no = data.get('reference_no', '')
+        note = data.get('note', '')
+
+        try:
+            amount = Decimal(str(amount_val))
+        except (ValueError, TypeError, Exception):
+            return JsonResponse({"success": False, "message": "Invalid amount format."}, status=400)
+
+        if amount <= Decimal('0.00'):
+            return JsonResponse({"success": False, "message": "Payment amount must be greater than zero."}, status=400)
+
+        with transaction.atomic():
+            invoice = Invoice.objects.select_for_update().get(id=invoice_id)
+            
+            if invoice.status == 'Paid' or invoice.remaining_amount <= Decimal('0.00'):
+                return JsonResponse({"success": False, "message": "Invoice is already fully paid."}, status=400)
+
+            if amount > invoice.remaining_amount:
+                return JsonResponse({"success": False, "message": f"Payment of ₹{amount} exceeds remaining balance of ₹{invoice.remaining_amount}."}, status=400)
+
+            # Create payment
+            from .models import InvoicePayment
+            InvoicePayment.objects.create(
+                invoice=invoice,
+                amount=amount,
+                payment_method=payment_method,
+                reference_no=reference_no,
+                note=note
+            )
+
+            # Update status
+            invoice.update_status()
+
+            return JsonResponse({
+                "success": True, 
+                "message": "Payment recorded successfully.",
+                "remaining_amount": float(invoice.remaining_amount),
+                "status": invoice.status
+            })
+
+    except Invoice.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Invoice not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+def get_invoice_payments(request, invoice_id):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        
+    try:
+        invoice = Invoice.objects.get(id=invoice_id)
+        payments = invoice.payments.all().order_by('created_at')
+        
+        payment_list = []
+        for p in payments:
+            payment_list.append({
+                "id": p.id,
+                "date": p.created_at.strftime("%d %b %Y"),
+                "amount": float(p.amount),
+                "method": p.payment_method,
+                "reference": p.reference_no,
+                "note": p.note
+            })
+            
+        return JsonResponse({
+            "success": True, 
+            "payments": payment_list,
+            "total_invoice": float(invoice.total_amount),
+            "advance_used": float(invoice.advance_used),
+            "total_payments": float(invoice.total_payments),
+            "remaining_amount": float(invoice.remaining_amount),
+            "status": invoice.status
+        })
+        
+    except Invoice.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Invoice not found."}, status=404)
 
 
 # --- Dashboard & Reports APIs ---
@@ -963,11 +1234,11 @@ def get_dashboard_stats(request):
     # Calculate Total Customers
     total_customers = Customer.objects.count()
     
-    # Calculate Outstanding Balance (Sum of Invoice totals minus advance_used)
-    invoices = Invoice.objects.filter(status__in=["Unpaid", "Partial"])
+    # Calculate Outstanding Balance (Sum of Invoice totals minus advance_used minus direct payments)
+    invoices = Invoice.objects.filter(status__in=["Unpaid", "Partial"]).prefetch_related('payments')
     outstanding_balance = 0
     for inv in invoices:
-        outstanding_balance += float(inv.total_amount) - float(inv.advance_used)
+        outstanding_balance += float(inv.remaining_amount)
         
     return JsonResponse({
         "success": True,
@@ -1007,36 +1278,20 @@ def get_recent_orders(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
         
-    orders = Order.objects.all().order_by('-created_at')[:5]
+    orders = Order.objects.all().prefetch_related('items').order_by('-created_at')[:5]
     data = []
     for order in orders:
+        # Calculate total weight from items, fallback to legacy weight if needed
+        total_weight = sum([float(item.weight) for item in order.items.all()]) if order.items.exists() else float(order.weight or 0)
         data.append({
             "id": order.order_number,
             "customer": order.customer.customer_name,
-            "weight": float(order.weight),
+            "weight": total_weight,
             "status": order.status,
             "date": order.created_at.strftime("%d %b %Y, %I:%M %p")
         })
         
     return JsonResponse({"success": True, "recent_orders": data})
-
-def get_sales_report(request):
-    if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-        
-    invoices = Invoice.objects.all().order_by('-created_at')
-    data = []
-    
-    for inv in invoices:
-        data.append({
-            "invoice_no": inv.invoice_number,
-            "date": inv.created_at.strftime("%d %b %Y"),
-            "customer": inv.order.customer.customer_name,
-            "amount": float(inv.total_amount),
-            "status": inv.status
-        })
-        
-    return JsonResponse({"success": True, "sales": data})
 
 def get_customer_purchase_report(request):
     if request.method != "GET":
@@ -1048,7 +1303,11 @@ def get_customer_purchase_report(request):
     for c in customers:
         orders = Order.objects.filter(customer=c)
         total_orders = orders.count()
-        total_weight = orders.aggregate(Sum('weight'))['weight__sum'] or 0
+        
+        # Sum weights from OrderItem
+        from .models import OrderItem
+        items_weight = OrderItem.objects.filter(order__customer=c).aggregate(Sum('weight'))['weight__sum'] or 0
+        total_weight = float(items_weight)
         
         invoices = Invoice.objects.filter(order__customer=c)
         total_spent = invoices.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
@@ -1057,7 +1316,7 @@ def get_customer_purchase_report(request):
             "customer": c.customer_name,
             "phone": c.phone_number,
             "total_orders": total_orders,
-            "total_weight": float(total_weight),
+            "total_weight": total_weight,
             "total_spent": float(total_spent)
         })
         

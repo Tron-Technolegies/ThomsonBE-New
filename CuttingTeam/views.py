@@ -11,11 +11,16 @@ def serialize_cutting_order(order):
     Serialize only the operational fields needed for the Cutting Team.
     Financial fields MUST NOT be included.
     """
+    items_list = []
+    if hasattr(order, 'items'):
+        items_list = [{"id": item.id, "chicken_type": item.chicken_type, "weight": str(item.weight)} for item in order.items.all()]
+        
     return {
         "id": order.order_number,
         "customer": order.customer.customer_name,
-        "type": order.chicken_type,
-        "weight": str(order.weight),
+        "type": order.chicken_type, # legacy
+        "weight": str(order.weight) if order.weight else "0", # legacy
+        "items": items_list,
         "status": order.status,
         "delivery_date": order.delivery_date.isoformat() if order.delivery_date else None,
         "notes": order.notes
@@ -31,7 +36,7 @@ def get_cutting_dashboard(request):
     cutting_count = orders_today.filter(status="Cutting").count()
     ready_count = orders_today.filter(status="Ready").count()
     
-    recent_orders = orders_today.order_by('-created_at')[:10]
+    recent_orders = orders_today.prefetch_related('items', 'customer').order_by('-created_at')[:10]
     serialized_recent = [serialize_cutting_order(o) for o in recent_orders]
     
     return JsonResponse({
@@ -50,10 +55,10 @@ def get_cutting_orders(request):
     # Could optionally filter by date here
     date_param = request.GET.get('date')
     if date_param:
-        orders = Order.objects.filter(delivery_date=date_param).order_by('-created_at')
+        orders = Order.objects.filter(delivery_date=date_param).prefetch_related('items', 'customer').order_by('-created_at')
     else:
         # Return all orders ordered by delivery date and created_at
-        orders = Order.objects.all().order_by('-delivery_date', '-created_at')
+        orders = Order.objects.all().prefetch_related('items', 'customer').order_by('-delivery_date', '-created_at')
     
     serialized_orders = [serialize_cutting_order(o) for o in orders]
     return JsonResponse({

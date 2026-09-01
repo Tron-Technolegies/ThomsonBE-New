@@ -1,5 +1,7 @@
 from django.db import models
+from django.db.models import Sum
 from datetime import datetime
+from decimal import Decimal
 
 class Customer(models.Model):
 
@@ -75,8 +77,8 @@ class Order(models.Model):
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name='orders')
     
     delivery_date = models.DateField()
-    chicken_type = models.CharField(max_length=50, choices=CHICKEN_TYPE_CHOICES)
-    weight = models.DecimalField(max_digits=10, decimal_places=2)
+    chicken_type = models.CharField(max_length=50, choices=CHICKEN_TYPE_CHOICES, null=True, blank=True)
+    weight = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending")
     
@@ -103,6 +105,15 @@ class Order(models.Model):
         return self.order_number
 
 
+class OrderItem(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
+    chicken_type = models.CharField(max_length=50, choices=Order.CHICKEN_TYPE_CHOICES)
+    weight = models.DecimalField(max_digits=10, decimal_places=2)
+    price_per_kg = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.order.order_number} - {self.chicken_type} - {self.weight}kg"
+
 class DailyPrice(models.Model):
     date = models.DateField()
     chicken_type = models.CharField(max_length=50, choices=Order.CHICKEN_TYPE_CHOICES)
@@ -125,11 +136,23 @@ class Invoice(models.Model):
         ("Paid", "Paid"),
     ]
 
+    GST_TYPE_CHOICES = [
+        ("percentage", "Percentage"),
+        ("fixed", "Fixed Amount"),
+    ]
+
     invoice_number = models.CharField(max_length=20, unique=True, editable=False)
     order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name='invoice')
     
-    selling_price_per_kg = models.DecimalField(max_digits=10, decimal_places=2)
-    gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    # Legacy fields
+    selling_price_per_kg = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    gst_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    
+    # New GST structure
+    gst_type = models.CharField(max_length=20, choices=GST_TYPE_CHOICES, default="fixed")
+    gst_input = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    calculated_gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+
     total_amount = models.DecimalField(max_digits=12, decimal_places=2)
     advance_used = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
     
@@ -156,6 +179,57 @@ class Invoice(models.Model):
     def __str__(self):
         return self.invoice_number
 
+    @property
+    def total_payments(self):
+        return self.payments.aggregate(Sum('amount'))['amount__sum'] or Decimal('0.00')
+
+    @property
+    def remaining_amount(self):
+        # Quantize just in case to ensure exact 2-decimal precision
+        rem = Decimal(str(self.total_amount)) - Decimal(str(self.advance_used)) - Decimal(str(self.total_payments))
+        return rem.quantize(Decimal('0.01'))
+
+    def update_status(self):
+        rem = self.remaining_amount
+        if rem <= Decimal('0.00'):
+            self.status = "Paid"
+        elif Decimal(str(self.advance_used)) > Decimal('0.00') or self.total_payments > Decimal('0.00'):
+            self.status = "Partial"
+        else:
+            self.status = "Unpaid"
+        self.save(update_fields=['status'])
+
+
+class InvoiceItem(models.Model):
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='items')
+    order_item = models.ForeignKey(OrderItem, on_delete=models.SET_NULL, null=True, blank=True)
+    
+    chicken_type_snapshot = models.CharField(max_length=50)
+    weight_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
+    selling_price_per_kg_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.invoice.invoice_number} - {self.chicken_type_snapshot}"
+
+
+class InvoicePayment(models.Model):
+    PAYMENT_METHOD_CHOICES = [
+        ("Cash", "Cash"),
+        ("Bank Transfer", "Bank Transfer"),
+        ("Cheque", "Cheque"),
+        ("UPI", "UPI"),
+    ]
+    
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='payments')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default="Cash")
+    reference_no = models.CharField(max_length=100, blank=True, null=True)
+    note = models.TextField(blank=True, null=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    def __str__(self):
+        return f"{self.invoice.invoice_number} - ₹{self.amount}"
 
 class AdvancePayment(models.Model):
     PAYMENT_METHOD_CHOICES = [
