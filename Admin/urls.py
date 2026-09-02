@@ -12,6 +12,7 @@ urlpatterns = [
     path("orders/stats/", views.get_order_stats, name="get_order_stats"),
     path("orders/add/", views.add_order, name="add_order"),
     path("orders/<int:order_id>/edit/", views.edit_order, name="edit_order"),
+    path("orders/<int:order_id>/delete/", views.delete_order, name="delete_order"),
     path("orders/<int:order_id>/pricing/", views.save_order_pricing, name="save_order_pricing"),
     
     path("daily-prices/", views.get_daily_prices, name="get_daily_prices"),

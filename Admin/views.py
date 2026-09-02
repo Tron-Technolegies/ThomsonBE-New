@@ -8,6 +8,7 @@ from django.db import transaction
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, date, timedelta
+from django.utils import timezone
 from decimal import Decimal
 import json
 
@@ -832,6 +833,20 @@ def get_accounts_orders(request):
     return JsonResponse({"success": True, "orders": order_list})
 
 @csrf_exempt
+def delete_order(request, order_id):
+    if request.method != "DELETE":
+        return JsonResponse({"success": False, "message": "DELETE method required."}, status=405)
+    
+    try:
+        order = Order.objects.get(id=order_id)
+        order.delete()
+        return JsonResponse({"success": True, "message": "Order deleted successfully."})
+    except Order.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+@csrf_exempt
 def save_order_pricing(request, order_id):
     if request.method != "POST":
         return JsonResponse({"success": False, "message": "POST method required."}, status=405)
@@ -1016,9 +1031,17 @@ def get_advances(request):
     end_date = request.GET.get('end_date')
     
     if start_date:
-        advances = advances.filter(created_at__date__gte=start_date)
+        try:
+            sd = timezone.make_aware(datetime.strptime(start_date, "%Y-%m-%d"))
+            advances = advances.filter(created_at__gte=sd)
+        except ValueError:
+            pass
     if end_date:
-        advances = advances.filter(created_at__date__lte=end_date)
+        try:
+            ed = timezone.make_aware(datetime.strptime(end_date, "%Y-%m-%d")) + timedelta(days=1)
+            advances = advances.filter(created_at__lt=ed)
+        except ValueError:
+            pass
     
     data = []
     for adv in advances:
@@ -1073,20 +1096,30 @@ def get_advance_balances(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
+    period = request.GET.get('period', 'All')
+    start_dt, end_dt = get_date_range(period)
+
     customers = Customer.objects.all()
     balances = []
     
     for customer in customers:
-        total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or 0
-        total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or 0
+        advances_qs = AdvancePayment.objects.filter(customer=customer)
+        invoices_qs = Invoice.objects.filter(order__customer=customer)
+
+        if start_dt and end_dt:
+            advances_qs = advances_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+            invoices_qs = invoices_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+
+        total_advances = advances_qs.aggregate(Sum('amount'))['amount__sum'] or 0
+        total_used = invoices_qs.aggregate(Sum('advance_used'))['advance_used__sum'] or 0
         
-        if total_advances > 0:
+        if total_advances > 0 or total_used > 0:
             total_advances = float(total_advances)
             total_used = float(total_used)
             balance = total_advances - total_used
             percent = (total_used / total_advances) * 100 if total_advances > 0 else 0
             
-            last_adv = AdvancePayment.objects.filter(customer=customer).order_by('-created_at').first()
+            last_adv = advances_qs.order_by('-created_at').first()
             last_tx = last_adv.created_at.strftime("%d %b %Y") if last_adv else "-"
             
             balances.append({
@@ -1106,13 +1139,27 @@ def get_all_invoices(request):
 
     invoices = Invoice.objects.all().prefetch_related('payments').order_by('-created_at')
 
+    period = request.GET.get('period')
     start_date = request.GET.get('start_date')
     end_date = request.GET.get('end_date')
     
-    if start_date:
-        invoices = invoices.filter(created_at__date__gte=start_date)
-    if end_date:
-        invoices = invoices.filter(created_at__date__lte=end_date)
+    if period and period != "All":
+        start_dt, end_dt = get_date_range(period)
+        if start_dt and end_dt:
+            invoices = invoices.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+    else:
+        if start_date:
+            try:
+                sd = timezone.make_aware(datetime.strptime(start_date, "%Y-%m-%d"))
+                invoices = invoices.filter(created_at__gte=sd)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                ed = timezone.make_aware(datetime.strptime(end_date, "%Y-%m-%d")) + timedelta(days=1)
+                invoices = invoices.filter(created_at__lt=ed)
+            except ValueError:
+                pass
     
     data = []
     for inv in invoices:
@@ -1219,25 +1266,51 @@ def get_invoice_payments(request, invoice_id):
         return JsonResponse({"success": False, "message": "Invoice not found."}, status=404)
 
 
+# --- Helper ---
+def get_date_range(period):
+    now = timezone.now()
+    if period == "Daily":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0), now
+    elif period == "Weekly":
+        start = now - timedelta(days=7)
+        return start.replace(hour=0, minute=0, second=0, microsecond=0), now
+    elif period == "Monthly":
+        start = now - timedelta(days=30)
+        return start.replace(hour=0, minute=0, second=0, microsecond=0), now
+    return None, None
+
 # --- Dashboard & Reports APIs ---
 
 def get_dashboard_stats(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
 
+    period = request.GET.get('period', 'All')
+    start_dt, end_dt = get_date_range(period)
+
+    # Base QuerySets
+    invoices_qs = Invoice.objects.all()
+    orders_qs = Order.objects.all()
+    customers_qs = Customer.objects.all()
+
+    if start_dt and end_dt:
+        invoices_qs = invoices_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+        orders_qs = orders_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+        customers_qs = customers_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+
     # Calculate Total Revenue (Sum of all Paid/Partial Invoice total_amount)
-    total_revenue = Invoice.objects.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+    total_revenue = invoices_qs.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
     
     # Calculate Total Orders
-    total_orders = Order.objects.count()
+    total_orders = orders_qs.count()
     
     # Calculate Total Customers
-    total_customers = Customer.objects.count()
+    total_customers = customers_qs.count()
     
     # Calculate Outstanding Balance (Sum of Invoice totals minus advance_used minus direct payments)
-    invoices = Invoice.objects.filter(status__in=["Unpaid", "Partial"]).prefetch_related('payments')
+    unpaid_invoices = invoices_qs.filter(status__in=["Unpaid", "Partial"]).prefetch_related('payments')
     outstanding_balance = 0
-    for inv in invoices:
+    for inv in unpaid_invoices:
         outstanding_balance += float(inv.remaining_amount)
         
     return JsonResponse({
@@ -1252,22 +1325,35 @@ def get_dashboard_charts(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
         
-    # Get last 7 days of sales for chart
+    period = request.GET.get('period', 'Daily')
+    if period == 'Daily':
+        days = 7
+    elif period == 'Weekly':
+        days = 30
+    elif period == 'Monthly':
+        days = 90
+    else:
+        days = 7
+        
     today = date.today()
     chart_data = []
     
-    for i in range(6, -1, -1):
+    for i in range(days-1, -1, -1):
         d = today - timedelta(days=i)
         
+        # Safe timezone-aware range for the day
+        start_of_day = timezone.make_aware(datetime.combine(d, datetime.min.time()))
+        end_of_day = start_of_day + timedelta(days=1)
+        
         # Revenue for this day
-        invs = Invoice.objects.filter(created_at__date=d)
+        invs = Invoice.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
         rev = invs.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
         
         # Orders for this day
-        ords = Order.objects.filter(order_date=d).count()
+        ords = Order.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day).count()
         
         chart_data.append({
-            "name": d.strftime("%d %b, %a"),
+            "name": d.strftime("%d %b, %a") if days <= 7 else d.strftime("%d %b"),
             "revenue": float(rev),
             "orders": ords
         })
@@ -1297,24 +1383,34 @@ def get_customer_purchase_report(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)
         
+    period = request.GET.get('period', 'All')
+    start_dt, end_dt = get_date_range(period)
+
     customers = Customer.objects.all()
     data = []
     
+    from .models import OrderItem
     for c in customers:
         orders = Order.objects.filter(customer=c)
+        order_items = OrderItem.objects.filter(order__customer=c)
+        invoices = Invoice.objects.filter(order__customer=c)
+
+        if start_dt and end_dt:
+            orders = orders.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+            order_items = order_items.filter(order__created_at__gte=start_dt, order__created_at__lte=end_dt)
+            invoices = invoices.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+
         total_orders = orders.count()
         
         # Sum weights from OrderItem
-        from .models import OrderItem
-        items_weight = OrderItem.objects.filter(order__customer=c).aggregate(Sum('weight'))['weight__sum'] or 0
+        items_weight = order_items.aggregate(Sum('weight'))['weight__sum'] or 0
         total_weight = float(items_weight)
         
-        invoices = Invoice.objects.filter(order__customer=c)
         total_spent = invoices.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
         
         data.append({
             "customer": c.customer_name,
-            "phone": c.phone_number,
+            "phone": c.phone,
             "total_orders": total_orders,
             "total_weight": total_weight,
             "total_spent": float(total_spent)
@@ -1358,22 +1454,4 @@ def clear_notifications(request):
         
     Notification.objects.all().delete()
     return JsonResponse({"success": True, "message": "All notifications cleared."})
-
-def get_all_invoices(request):
-    if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-        
-    invoices = Invoice.objects.all().order_by('-created_at')
-    data = []
-    for i in invoices:
-        data.append({
-            "id": i.invoice_number,
-            "customer": i.order.customer.customer_name,
-            "date": i.created_at.strftime("%d %b %Y"),
-            "amount": float(i.total_amount - i.gst_amount),
-            "tax": float(i.gst_amount),
-            "total": float(i.total_amount),
-            "status": i.status
-        })
-        
-    return JsonResponse({"success": True, "invoices": data})
+
