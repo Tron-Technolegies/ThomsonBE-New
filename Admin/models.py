@@ -58,12 +58,96 @@ class Customer(models.Model):
     def __str__(self):
         return self.customer_name
 
+    @property
+    def performance_score(self):
+        from .models import OrderItem, Invoice
+        from django.utils import timezone
+        from decimal import Decimal
+        from django.db.models import Sum
+
+        score = 0
+        
+        # 1. Purchase Volume (Max 30 points)
+        # Cap at 500kg for max points
+        total_weight = OrderItem.objects.filter(order__customer=self).aggregate(Sum('weight'))['weight__sum'] or Decimal('0.00')
+        volume_points = min(30, (float(total_weight) / 500.0) * 30)
+        score += volume_points
+        
+        # 2. Purchase Frequency (Max 30 points)
+        # Cap at 20 orders for max points
+        order_count = self.orders.count()
+        freq_points = min(30, (order_count / 20.0) * 30)
+        score += freq_points
+        
+        # 3. Payment Clearance & Timing (Max 40 points)
+        invoices = Invoice.objects.filter(order__customer=self)
+        if not invoices.exists():
+            # Neutral payment score for new customers
+            score += 40
+            return int(max(0, min(100, score)))
+            
+        total_billed = sum(inv.total_amount for inv in invoices)
+        if total_billed == Decimal('0.00'):
+            score += 40
+            return int(max(0, min(100, score)))
+            
+        # Total Paid
+        total_unpaid = sum(inv.remaining_amount for inv in invoices)
+        total_paid = float(total_billed) - float(total_unpaid)
+        
+        # Ratio points (Max 20 points)
+        ratio_points = (total_paid / float(total_billed)) * 20
+        score += max(0, min(20, ratio_points))
+        
+        # Clearance Timing (Max 20 points)
+        paid_invoices = [inv for inv in invoices if inv.status == "Paid"]
+        if paid_invoices:
+            total_days = 0
+            count = 0
+            for inv in paid_invoices:
+                last_payment = inv.payments.order_by('-created_at').first()
+                if last_payment:
+                    days = (last_payment.created_at - inv.created_at).days
+                    total_days += max(0, days)
+                    count += 1
+            
+            if count > 0:
+                avg_days = total_days / count
+                if avg_days <= 3:
+                    score += 20
+                elif avg_days <= 7:
+                    score += 15
+                elif avg_days <= 15:
+                    score += 10
+                elif avg_days <= 30:
+                    score += 5
+            else:
+                # Fully paid via advances maybe
+                score += 20
+                
+        # Deduct points for severely overdue invoices
+        now = timezone.now()
+        overdue_invoices = [inv for inv in invoices if inv.status in ["Unpaid", "Partial"]]
+        overdue_points = 0
+        for inv in overdue_invoices:
+            days_unpaid = (now - inv.created_at).days
+            if days_unpaid > 30:
+                overdue_points += 5
+        
+        score -= overdue_points
+        
+        return int(max(0, min(100, score)))
+
+class Category(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+ 
+    def __str__(self):
+        return self.name
+
 class Order(models.Model):
-    CHICKEN_TYPE_CHOICES = [
-        ("Full Chicken", "Full Chicken"),
-        ("Dressed Chicken", "Dressed Chicken"),
-        ("Boneless Chicken", "Boneless Chicken"),
-    ]
 
     STATUS_CHOICES = [
         ("Pending", "Pending"),
@@ -77,10 +161,13 @@ class Order(models.Model):
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name='orders')
     
     delivery_date = models.DateField()
-    chicken_type = models.CharField(max_length=50, choices=CHICKEN_TYPE_CHOICES, null=True, blank=True)
+    chicken_type = models.CharField(max_length=50, null=True, blank=True)
     weight = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending")
+    
+    # Cutting Team Operational Tracking Fields
+    cutting_notes = models.TextField(blank=True, null=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -107,16 +194,21 @@ class Order(models.Model):
 
 class OrderItem(models.Model):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
-    chicken_type = models.CharField(max_length=50, choices=Order.CHICKEN_TYPE_CHOICES)
+    chicken_type = models.CharField(max_length=50)
     weight = models.DecimalField(max_digits=10, decimal_places=2)
     price_per_kg = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    # Cutting Team Category-wise Tracking Fields
+    received_quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    waste_quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    meat_delivered = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
 
     def __str__(self):
         return f"{self.order.order_number} - {self.chicken_type} - {self.weight}kg"
 
 class DailyPrice(models.Model):
     date = models.DateField()
-    chicken_type = models.CharField(max_length=50, choices=Order.CHICKEN_TYPE_CHOICES)
+    chicken_type = models.CharField(max_length=50)
     price = models.DecimalField(max_digits=10, decimal_places=2)
 
     created_at = models.DateTimeField(auto_now_add=True)

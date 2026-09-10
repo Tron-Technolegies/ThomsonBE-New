@@ -12,7 +12,7 @@ from django.utils import timezone
 from decimal import Decimal
 import json
 
-from .models import Customer, Order, OrderItem, DailyPrice, Invoice, InvoiceItem, AdvancePayment, Notification
+from .models import Customer, Order, OrderItem, DailyPrice, Invoice, InvoiceItem, AdvancePayment, Notification, Category
 
 
 @csrf_exempt
@@ -165,7 +165,13 @@ def view_all_customers(request):
             status=405
         )
 
-    customers = Customer.objects.all().order_by("-created_at")
+    from django.db.models import Sum, Count
+    from decimal import Decimal
+
+    customers = Customer.objects.annotate(
+        total_orders=Count('orders', distinct=True),
+        total_purchase_volume=Sum('orders__items__weight')
+    ).order_by("-created_at")
 
     search = request.GET.get("search", "").strip()
     customer_type = request.GET.get("customer_type", "").strip()
@@ -207,6 +213,9 @@ def view_all_customers(request):
                 "customer_type": customer.customer_type,
                 "status": customer.status,
                 "address": customer.address,
+                "performance_score": customer.performance_score,
+                "total_orders": customer.total_orders,
+                "total_purchase_volume": float(customer.total_purchase_volume or 0),
                 "created_at": customer.created_at,
                 "updated_at": customer.updated_at
             }
@@ -251,11 +260,20 @@ def view_single_customer(request, customer_id):
     
     purchase_history = []
     for inv in invoices:
+        items = inv.order.items.all()
+        if items.exists():
+            item_names = [f"{item.chicken_type.capitalize()}" for item in items]
+            item_str = ", ".join(item_names)
+        elif inv.order.chicken_type:
+            item_str = f"{inv.order.chicken_type.capitalize()}"
+        else:
+            item_str = "Mixed Items"
+            
         purchase_history.append({
             "invoice": inv.invoice_number,
             "date": inv.created_at.strftime("%d %b %Y"),
-            "item": f"{inv.order.chicken_type.capitalize()} Chicken",
-            "weight": f"{float(inv.order.weight)} kg",
+            "item": item_str,
+            "weight": f"{float(inv.order.weight)} kg" if inv.order.weight else f"{sum(item.weight for item in items)} kg",
             "amount": f"₹{float(inv.total_amount):,.2f}",
             "status": inv.status
         })
@@ -312,6 +330,7 @@ def view_single_customer(request, customer_id):
                 "customer_type": customer.customer_type,
                 "status": customer.status,
                 "address": customer.address,
+                "performance_score": customer.performance_score,
                 "created_at": customer.created_at,
                 "updated_at": customer.updated_at,
                 "purchase_history": purchase_history,
@@ -603,7 +622,41 @@ def view_all_orders(request):
 
     order_list = []
     for order in orders:
-        items_list = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight)} for oi in order.items.all()]
+        total_expected_value = Decimal('0.00')
+        total_actual_value = Decimal('0.00')
+        total_received = Decimal('0.00')
+        total_waste = Decimal('0.00')
+        total_meat = Decimal('0.00')
+        
+        items_list = []
+        for oi in order.items.all():
+            weight = Decimal(str(oi.weight)) if oi.weight else Decimal('0.00')
+            price = Decimal(str(oi.price_per_kg)) if oi.price_per_kg else Decimal('0.00')
+            received = Decimal(str(oi.received_quantity)) if oi.received_quantity else Decimal('0.00')
+            waste = Decimal(str(oi.waste_quantity)) if oi.waste_quantity else Decimal('0.00')
+            meat = Decimal(str(oi.meat_delivered)) if oi.meat_delivered else Decimal('0.00')
+            
+            expected_price = weight * price
+            actual_price = meat * price
+            
+            total_expected_value += expected_price
+            total_actual_value += actual_price
+            total_received += received
+            total_waste += waste
+            total_meat += meat
+            
+            items_list.append({
+                "id": oi.id, 
+                "chicken_type": oi.chicken_type, 
+                "weight": str(oi.weight),
+                "price_per_kg": float(oi.price_per_kg) if oi.price_per_kg else None,
+                "received_quantity": str(oi.received_quantity) if oi.received_quantity else "",
+                "waste_quantity": str(oi.waste_quantity) if oi.waste_quantity else "",
+                "meat_delivered": str(oi.meat_delivered) if oi.meat_delivered else "",
+                "expected_price": float(expected_price.quantize(Decimal('0.01'))),
+                "actual_price": float(actual_price.quantize(Decimal('0.01')))
+            })
+            
         order_list.append({
             "id": order.id,
             "order_number": order.order_number,
@@ -615,7 +668,14 @@ def view_all_orders(request):
             "items": items_list,
             "status": order.status,
             "notes": order.notes,
+            "cutting_notes": order.cutting_notes,
             "created_at": order.created_at,
+            # Yield Aggregates
+            "total_received": float(total_received.quantize(Decimal('0.01'))),
+            "total_waste": float(total_waste.quantize(Decimal('0.01'))),
+            "total_meat": float(total_meat.quantize(Decimal('0.01'))),
+            "total_expected_value": float(total_expected_value.quantize(Decimal('0.01'))),
+            "total_actual_value": float(total_actual_value.quantize(Decimal('0.01'))),
         })
 
     return JsonResponse({"success": True, "count": len(order_list), "orders": order_list})
@@ -773,7 +833,9 @@ def update_daily_prices(request):
             target_date = date.today()
 
         updated_prices = {}
-        for c_type in dict(Order.CHICKEN_TYPE_CHOICES).keys():
+        active_categories = Category.objects.filter(is_active=True)
+        for cat in active_categories:
+            c_type = cat.name
             if c_type in prices_data:
                 obj, created = DailyPrice.objects.update_or_create(
                     date=target_date,
@@ -790,6 +852,50 @@ def update_daily_prices(request):
         })
     except Exception as e:
         return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+
+# --- Category APIs ---
+def get_categories(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+    
+    categories = Category.objects.filter(is_active=True).order_by('name')
+    data = [{"id": c.id, "name": c.name} for c in categories]
+    return JsonResponse({"success": True, "categories": data})
+
+@csrf_exempt
+def add_category(request):
+    if request.method != "POST":
+        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+    
+    try:
+        data = json.loads(request.body)
+        name = data.get("name", "").strip()
+        if not name:
+            return JsonResponse({"success": False, "message": "Category name is required."}, status=400)
+            
+        category, created = Category.objects.get_or_create(name=name)
+        if not created and not category.is_active:
+            category.is_active = True
+            category.save()
+            
+        return JsonResponse({"success": True, "message": "Category added.", "category": {"id": category.id, "name": category.name}})
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+@csrf_exempt
+def delete_category(request, category_id):
+    if request.method != "DELETE":
+        return JsonResponse({"success": False, "message": "DELETE method required."}, status=405)
+        
+    try:
+        category = Category.objects.get(id=category_id)
+        # Soft delete
+        category.is_active = False
+        category.save()
+        return JsonResponse({"success": True, "message": "Category removed."})
+    except Category.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Category not found."}, status=404)
 
 
 # --- Accounts/Invoice APIs ---
@@ -816,7 +922,40 @@ def get_accounts_orders(request):
                 "status": order.invoice.status,
             }
         
-        items_list = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight), "price_per_kg": float(oi.price_per_kg) if oi.price_per_kg else None} for oi in order.items.all()]
+        total_expected_value = Decimal('0.00')
+        total_actual_value = Decimal('0.00')
+        total_received = Decimal('0.00')
+        total_waste = Decimal('0.00')
+        total_meat = Decimal('0.00')
+        
+        items_list = []
+        for oi in order.items.all():
+            weight = Decimal(str(oi.weight)) if oi.weight else Decimal('0.00')
+            price = Decimal(str(oi.price_per_kg)) if oi.price_per_kg else Decimal('0.00')
+            received = Decimal(str(oi.received_quantity)) if oi.received_quantity else Decimal('0.00')
+            waste = Decimal(str(oi.waste_quantity)) if oi.waste_quantity else Decimal('0.00')
+            meat = Decimal(str(oi.meat_delivered)) if oi.meat_delivered else Decimal('0.00')
+            
+            expected_price = weight * price
+            actual_price = meat * price
+            
+            total_expected_value += expected_price
+            total_actual_value += actual_price
+            total_received += received
+            total_waste += waste
+            total_meat += meat
+            
+            items_list.append({
+                "id": oi.id, 
+                "chicken_type": oi.chicken_type, 
+                "weight": str(oi.weight),
+                "price_per_kg": float(oi.price_per_kg) if oi.price_per_kg else None,
+                "received_quantity": str(oi.received_quantity) if oi.received_quantity else "",
+                "waste_quantity": str(oi.waste_quantity) if oi.waste_quantity else "",
+                "meat_delivered": str(oi.meat_delivered) if oi.meat_delivered else "",
+                "expected_price": float(expected_price.quantize(Decimal('0.01'))),
+                "actual_price": float(actual_price.quantize(Decimal('0.01')))
+            })
 
         order_list.append({
             "id": order.id,
@@ -827,7 +966,14 @@ def get_accounts_orders(request):
             "weight": str(order.weight) if order.weight else "0", # legacy
             "items": items_list,
             "status": order.status,
-            "invoice": invoice_data
+            "invoice": invoice_data,
+            "cutting_notes": order.cutting_notes,
+            # Yield Aggregates
+            "total_received": float(total_received.quantize(Decimal('0.01'))),
+            "total_waste": float(total_waste.quantize(Decimal('0.01'))),
+            "total_meat": float(total_meat.quantize(Decimal('0.01'))),
+            "total_expected_value": float(total_expected_value.quantize(Decimal('0.01'))),
+            "total_actual_value": float(total_actual_value.quantize(Decimal('0.01'))),
         })
 
     return JsonResponse({"success": True, "orders": order_list})

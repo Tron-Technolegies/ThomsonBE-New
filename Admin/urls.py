@@ -18,6 +18,10 @@ urlpatterns = [
     path("daily-prices/", views.get_daily_prices, name="get_daily_prices"),
     path("daily-prices/update/", views.update_daily_prices, name="update_daily_prices"),
     
+    path("categories/", views.get_categories, name="get_categories"),
+    path("categories/add/", views.add_category, name="add_category"),
+    path("categories/<int:category_id>/delete/", views.delete_category, name="delete_category"),
+
     path("accounts/orders/", views.get_accounts_orders, name="get_accounts_orders"),
     path("invoices/create/", views.create_invoice, name="create_invoice"),
     path("invoices/", views.get_all_invoices, name="get_all_invoices"),

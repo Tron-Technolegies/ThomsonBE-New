@@ -13,7 +13,14 @@ def serialize_cutting_order(order):
     """
     items_list = []
     if hasattr(order, 'items'):
-        items_list = [{"id": item.id, "chicken_type": item.chicken_type, "weight": str(item.weight)} for item in order.items.all()]
+        items_list = [{
+            "id": item.id, 
+            "chicken_type": item.chicken_type, 
+            "weight": str(item.weight),
+            "received_quantity": str(item.received_quantity) if item.received_quantity else "",
+            "waste_quantity": str(item.waste_quantity) if item.waste_quantity else "",
+            "meat_delivered": str(item.meat_delivered) if item.meat_delivered else ""
+        } for item in order.items.all()]
         
     return {
         "id": order.order_number,
@@ -23,6 +30,7 @@ def serialize_cutting_order(order):
         "items": items_list,
         "status": order.status,
         "delivery_date": order.delivery_date.isoformat() if order.delivery_date else None,
+        "cutting_notes": order.cutting_notes or "",
         "notes": order.notes
     }
 
@@ -68,7 +76,7 @@ def get_cutting_orders(request):
 
 @csrf_exempt
 @require_http_methods(["PUT"])
-def update_cutting_order_status(request, order_number):
+def update_cutting_order(request, order_number):
     try:
         order = Order.objects.get(order_number=order_number)
     except Order.DoesNotExist:
@@ -77,6 +85,8 @@ def update_cutting_order_status(request, order_number):
     try:
         data = json.loads(request.body)
         new_status = data.get("status")
+        notes = data.get("cutting_notes")
+        items_data = data.get("items", [])
         
         if not new_status:
             return JsonResponse({"status": "error", "message": "Status is required"}, status=400)
@@ -86,20 +96,40 @@ def update_cutting_order_status(request, order_number):
         if new_status not in allowed_statuses:
             return JsonResponse({"status": "error", "message": "Invalid status transition for Cutting team"}, status=400)
             
-        # We only update the status field to ensure no other fields (e.g. weight, financial fields) are modified
+        update_fields = ['status', 'updated_at']
         order.status = new_status
-        order.save(update_fields=['status', 'updated_at'])
+            
+        if notes is not None:
+            order.cutting_notes = notes
+            update_fields.append('cutting_notes')
+
+        order.save(update_fields=update_fields)
+        
+        # Update Items
+        if items_data:
+            from Admin.models import OrderItem
+            for item_data in items_data:
+                item_id = item_data.get("id")
+                if item_id:
+                    try:
+                        item = OrderItem.objects.get(id=item_id, order=order)
+                        item.received_quantity = item_data.get("received_quantity") or None
+                        item.waste_quantity = item_data.get("waste_quantity") or None
+                        item.meat_delivered = item_data.get("meat_delivered") or None
+                        item.save(update_fields=['received_quantity', 'waste_quantity', 'meat_delivered'])
+                    except OrderItem.DoesNotExist:
+                        pass
         
         # Notify admin of the status change
         Notification.objects.create(
             type="order",
-            title="Order Status Updated",
+            title="Order Updated by Cutting Team",
             description=f"Order {order.order_number} for {order.customer.customer_name} is now {new_status}."
         )
         
         return JsonResponse({
             "status": "success",
-            "message": "Order status updated successfully",
+            "message": "Order updated successfully",
             "data": serialize_cutting_order(order)
         })
         
