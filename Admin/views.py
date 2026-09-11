@@ -10,9 +10,10 @@ from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, date, timedelta
 from django.utils import timezone
 from decimal import Decimal
+from django.views.decorators.http import require_http_methods
 import json
 
-from .models import Customer, Order, OrderItem, DailyPrice, Invoice, InvoiceItem, AdvancePayment, Notification, Category
+from .models import Customer, Order, OrderItem, DailyPrice, Invoice, InvoiceItem, AdvancePayment, Notification, Category, CustomerCategoryPrice
 
 
 @csrf_exempt
@@ -519,6 +520,48 @@ def delete_customer(request, customer_id):
         }
     )
 
+@require_http_methods(["GET"])
+def get_customer_prices(request, customer_id):
+    try:
+        customer = Customer.objects.get(id=customer_id)
+        prices = CustomerCategoryPrice.objects.filter(customer=customer)
+        price_dict = {p.category.name: float(p.price) for p in prices}
+        return JsonResponse({"success": True, "prices": price_dict})
+    except Customer.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+@csrf_exempt
+@require_http_methods(["PUT"])
+def update_customer_prices(request, customer_id):
+    try:
+        customer = Customer.objects.get(id=customer_id)
+        data = json.loads(request.body)
+        prices = data.get('prices', {})
+        
+        with transaction.atomic():
+            for cat_name, price_val in prices.items():
+                if price_val == "" or price_val is None:
+                    continue
+                try:
+                    category = Category.objects.get(name=cat_name)
+                    # Create or update price
+                    CustomerCategoryPrice.objects.update_or_create(
+                        customer=customer,
+                        category=category,
+                        defaults={'price': Decimal(str(price_val))}
+                    )
+                except Category.DoesNotExist:
+                    continue
+                    
+        return JsonResponse({"success": True, "message": "Prices updated successfully."})
+    except Customer.DoesNotExist:
+        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+
 @csrf_exempt
 def add_order(request):
     if request.method != "POST":
@@ -961,6 +1004,7 @@ def get_accounts_orders(request):
             "id": order.id,
             "order_number": order.order_number,
             "customer": order.customer.customer_name,
+            "customer_id": order.customer.id,
             "delivery_date": order.delivery_date,
             "chicken_type": order.chicken_type, # legacy
             "weight": str(order.weight) if order.weight else "0", # legacy
@@ -976,7 +1020,29 @@ def get_accounts_orders(request):
             "total_actual_value": float(total_actual_value.quantize(Decimal('0.01'))),
         })
 
-    return JsonResponse({"success": True, "orders": order_list})
+    # Calculate daily category-wise sales
+    category_sales = {}
+    for order in orders:
+        if hasattr(order, 'invoice'): # Only count billed items maybe? The prompt says "Daily category-wise sales". Usually this implies invoiced or at least ready to bill. Let's count all orders in this list (Ready/Delivered).
+            pass
+        for oi in order.items.all():
+            meat = Decimal(str(oi.meat_delivered)) if oi.meat_delivered else Decimal('0.00')
+            price = Decimal(str(oi.price_per_kg)) if oi.price_per_kg else Decimal('0.00')
+            if meat > 0 and price > 0:
+                cat_name = oi.chicken_type
+                if cat_name not in category_sales:
+                    category_sales[cat_name] = {'weight': Decimal('0.00'), 'value': Decimal('0.00')}
+                category_sales[cat_name]['weight'] += meat
+                category_sales[cat_name]['value'] += (meat * price)
+    
+    formatted_sales = {}
+    for cat, data in category_sales.items():
+        formatted_sales[cat] = {
+            'weight': float(data['weight'].quantize(Decimal('0.01'))),
+            'value': float(data['value'].quantize(Decimal('0.01')))
+        }
+
+    return JsonResponse({"success": True, "orders": order_list, "daily_category_sales": formatted_sales})
 
 @csrf_exempt
 def delete_order(request, order_id):

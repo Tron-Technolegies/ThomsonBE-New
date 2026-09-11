@@ -8,6 +8,9 @@ urlpatterns = [
     path("customers/<int:customer_id>/edit/", views.edit_customer, name="edit_customer"),
     path("customers/<int:customer_id>/delete/", views.delete_customer, name="delete_customer"),
     
+    path("customers/<int:customer_id>/prices/", views.get_customer_prices, name="get_customer_prices"),
+    path("customers/<int:customer_id>/prices/update/", views.update_customer_prices, name="update_customer_prices"),
+    
     path("orders/", views.view_all_orders, name="view_all_orders"),
     path("orders/stats/", views.get_order_stats, name="get_order_stats"),
     path("orders/add/", views.add_order, name="add_order"),
