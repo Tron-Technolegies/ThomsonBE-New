@@ -1,5 +1,6 @@
 from django.urls import path
 from . import views
+from . import auth_views
 
 urlpatterns = [
     path("customers/add/", views.add_customer, name="add_customer"),
@@ -44,4 +45,13 @@ urlpatterns = [
     path("notifications/", views.get_notifications, name="get_notifications"),
     path("notifications/read/", views.mark_notifications_read, name="mark_notifications_read"),
     path("notifications/clear/", views.clear_notifications, name="clear_notifications"),
+    
+    # Auth endpoints
+    path('auth/login/', auth_views.CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    
+    # Staff endpoints
+    path('staff/', auth_views.get_staff_list, name='get_staff_list'),
+    path('staff/create/', auth_views.create_staff, name='create_staff'),
+    path('staff/<int:user_id>/update/', auth_views.update_staff, name='update_staff'),
+    path('staff/<int:user_id>/delete/', auth_views.delete_staff, name='delete_staff'),
 ]

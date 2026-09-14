@@ -1524,13 +1524,33 @@ def get_dashboard_stats(request):
     outstanding_balance = 0
     for inv in unpaid_invoices:
         outstanding_balance += float(inv.remaining_amount)
+
+    # Calculate Yield (Meat / Waste / Received) for the selected period
+    from .models import OrderItem
+    
+    # We only care about yield for orders that have been processed by cutting (not pending/cancelled usually, or all orders in period)
+    valid_yield_orders = orders_qs.exclude(status__in=['Pending', 'Cancelled'])
+    yield_stats = OrderItem.objects.filter(order__in=valid_yield_orders).aggregate(
+        total_received=Sum('received_quantity'),
+        total_waste=Sum('waste_quantity'),
+        total_meat=Sum('meat_delivered')
+    )
+    
+    received = float(yield_stats['total_received'] or 0)
+    waste = float(yield_stats['total_waste'] or 0)
+    meat = float(yield_stats['total_meat'] or 0)
         
     return JsonResponse({
         "success": True,
         "revenue": float(total_revenue),
         "orders": total_orders,
         "customers": total_customers,
-        "outstanding": float(outstanding_balance)
+        "outstanding": float(outstanding_balance),
+        "yield": {
+            "received": received,
+            "waste": waste,
+            "meat": meat
+        }
     })
 
 def get_dashboard_charts(request):
