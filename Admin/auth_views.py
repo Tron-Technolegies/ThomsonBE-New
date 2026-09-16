@@ -8,23 +8,23 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    def validate(self, attrs):
-        data = super().validate(attrs)
-        
-        # Add custom claims
-        data['username'] = self.user.username
-        data['email'] = self.user.email
-        
-        try:
-            profile = self.user.staff_profile
-            data['role'] = profile.role
-        except StaffProfile.DoesNotExist:
-            if self.user.is_superuser:
-                data['role'] = 'admin'
-            else:
-                data['role'] = 'unknown'
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
 
-        return data
+        # Add custom claims
+        token['username'] = user.username
+        token['email'] = user.email
+        
+        if hasattr(user, 'staff_profile'):
+            token['role'] = user.staff_profile.role
+        else:
+            if user.is_superuser:
+                token['role'] = 'admin'
+            else:
+                token['role'] = 'unknown'
+
+        return token
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
