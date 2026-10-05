@@ -9,7 +9,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, date, timedelta
 from django.utils import timezone
-from decimal import Decimal
+from decimal import Decimal,InvalidOperation
 from django.views.decorators.http import require_http_methods
 import json
 
@@ -616,10 +616,22 @@ def add_order(request):
     
     # Create OrderItems
     for item in items:
+        chicken_type = item.get("chicken_type")
+        yield_percentage = None
+
+        try:
+            category = Category.objects.get(
+                name__iexact=chicken_type
+            )
+            yield_percentage = category.approx_yield_percentage
+        except Category.DoesNotExist:
+            pass
+
         OrderItem.objects.create(
             order=order,
-            chicken_type=item.get("chicken_type"),
-            weight=item.get("weight")
+            chicken_type=chicken_type,
+            weight=item.get("weight"),
+            approx_yield_percentage=yield_percentage
         )
 
     # Create Notification for Cutting Team
@@ -678,6 +690,24 @@ def view_all_orders(request):
             received = Decimal(str(oi.received_quantity)) if oi.received_quantity else Decimal('0.00')
             waste = Decimal(str(oi.waste_quantity)) if oi.waste_quantity else Decimal('0.00')
             meat = Decimal(str(oi.meat_delivered)) if oi.meat_delivered else Decimal('0.00')
+            yield_percentage = (
+                Decimal(str(oi.approx_yield_percentage))
+                if oi.approx_yield_percentage is not None
+                else Decimal('0.00')
+            )
+
+            # Expected meat based on raw/received quantity
+            expected_meat = (
+                received * yield_percentage / Decimal('100')
+            )
+
+            # Actual yield based on actual meat
+            actual_yield_percentage = Decimal('0.00')
+
+            if received > 0:
+                actual_yield_percentage = (
+                    meat / received
+                ) * Decimal('100')
             
             expected_price = weight * price
             actual_price = meat * price
@@ -697,7 +727,10 @@ def view_all_orders(request):
                 "waste_quantity": str(oi.waste_quantity) if oi.waste_quantity else "",
                 "meat_delivered": str(oi.meat_delivered) if oi.meat_delivered else "",
                 "expected_price": float(expected_price.quantize(Decimal('0.01'))),
-                "actual_price": float(actual_price.quantize(Decimal('0.01')))
+                "actual_price": float(actual_price.quantize(Decimal('0.01'))),
+                "approx_yield_percentage": float(yield_percentage.quantize(Decimal('0.01'))),
+                "expected_meat": float(expected_meat.quantize(Decimal('0.01'))),
+                "actual_yield_percentage": float(actual_yield_percentage.quantize(Decimal('0.01'))),
             })
             
         order_list.append({
@@ -726,66 +759,147 @@ def view_all_orders(request):
 @csrf_exempt
 def edit_order(request, order_id):
     if request.method != "PUT":
-        return JsonResponse({"success": False, "message": "PUT method required."}, status=405)
+        return JsonResponse(
+            {"success": False, "message": "PUT method required."},
+            status=405
+        )
 
     try:
         order = Order.objects.get(id=order_id)
     except Order.DoesNotExist:
-        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+        return JsonResponse(
+            {"success": False, "message": "Order not found."},
+            status=404
+        )
 
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
-        return JsonResponse({"success": False, "message": "Invalid JSON data."}, status=400)
-
-    from .models import OrderItem
+        return JsonResponse(
+            {"success": False, "message": "Invalid JSON data."},
+            status=400
+        )
 
     if "customer_id" in data:
         try:
-            order.customer = Customer.objects.get(id=data["customer_id"])
+            order.customer = Customer.objects.get(
+                id=data["customer_id"]
+            )
         except Customer.DoesNotExist:
-            return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+            return JsonResponse(
+                {"success": False, "message": "Customer not found."},
+                status=404
+            )
 
     if "delivery_date" in data:
         order.delivery_date = data["delivery_date"]
+
     if "status" in data:
         order.status = data["status"]
+
     if "notes" in data:
         order.notes = data["notes"]
 
-    # Handle items / legacy dual-write
+    # ---------------------------------------
+    # Handle items / legacy compatibility
+    # ---------------------------------------
+
     items = data.get("items")
     chicken_type = data.get("chicken_type")
     weight = data.get("weight")
-    
+
     if items is not None:
-        if len(items) > 0:
-            order.chicken_type = items[0].get("chicken_type")
-            order.weight = items[0].get("weight")
-            # Replace existing items securely
-            order.items.all().delete()
-            for item in items:
-                OrderItem.objects.create(
-                    order=order,
-                    chicken_type=item.get("chicken_type"),
-                    weight=item.get("weight")
+
+        if len(items) == 0:
+            return JsonResponse(
+                {
+                    "success": False,
+                    "message": "Order must have at least one item."
+                },
+                status=400
+            )
+
+        # Sync legacy Order fields with first item
+        order.chicken_type = items[0].get("chicken_type")
+        order.weight = items[0].get("weight")
+
+        # Remove previous items
+        order.items.all().delete()
+
+        # Create updated items
+        for item in items:
+
+            item_chicken_type = item.get("chicken_type")
+            item_weight = item.get("weight")
+
+            yield_percentage = None
+
+            try:
+                category = Category.objects.get(
+                    name__iexact=item_chicken_type
                 )
+
+                yield_percentage = (
+                    category.approx_yield_percentage
+                )
+
+            except Category.DoesNotExist:
+                pass
+
+            OrderItem.objects.create(
+                order=order,
+                chicken_type=item_chicken_type,
+                weight=item_weight,
+                approx_yield_percentage=yield_percentage
+            )
+
+    # Legacy format
     elif chicken_type or weight:
+
         if chicken_type:
             order.chicken_type = chicken_type
+
         if weight:
             order.weight = weight
-        # Only rewrite if items weren't provided to maintain legacy compatibility
+
+        yield_percentage = None
+
+        try:
+            category = Category.objects.get(
+                name__iexact=order.chicken_type
+            )
+
+            yield_percentage = (
+                category.approx_yield_percentage
+            )
+
+        except Category.DoesNotExist:
+            pass
+
         order.items.all().delete()
+
         OrderItem.objects.create(
             order=order,
             chicken_type=order.chicken_type,
-            weight=order.weight
+            weight=order.weight,
+            approx_yield_percentage=yield_percentage
         )
 
     order.save()
 
-    items_response = [{"id": oi.id, "chicken_type": oi.chicken_type, "weight": str(oi.weight)} for oi in order.items.all()]
+    items_response = []
+
+    for oi in order.items.all():
+        items_response.append({
+            "id": oi.id,
+            "chicken_type": oi.chicken_type,
+            "weight": str(oi.weight),
+            "approx_yield_percentage": (
+                float(oi.approx_yield_percentage)
+                if oi.approx_yield_percentage is not None
+                else None
+            )
+        })
 
     return JsonResponse({
         "success": True,
@@ -796,8 +910,8 @@ def edit_order(request, order_id):
             "customer": order.customer.customer_name,
             "customer_id": order.customer.id,
             "delivery_date": order.delivery_date,
-            "chicken_type": order.chicken_type, # legacy
-            "weight": str(order.weight) if order.weight else "0", # legacy
+            "chicken_type": order.chicken_type,
+            "weight": str(order.weight) if order.weight else "0",
             "items": items_response,
             "status": order.status,
             "notes": order.notes,
@@ -900,31 +1014,241 @@ def update_daily_prices(request):
 # --- Category APIs ---
 def get_categories(request):
     if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-    
-    categories = Category.objects.filter(is_active=True).order_by('name')
-    data = [{"id": c.id, "name": c.name} for c in categories]
-    return JsonResponse({"success": True, "categories": data})
+        return JsonResponse(
+            {"success": False, "message": "GET method required."},
+            status=405
+        )
+
+    categories = Category.objects.filter(
+        is_active=True
+    ).order_by("name")
+
+    data = [
+        {
+            "id": c.id,
+            "name": c.name,
+            "approx_yield_percentage": float(
+                c.approx_yield_percentage
+            )
+        }
+        for c in categories
+    ]
+
+    return JsonResponse({
+        "success": True,
+        "categories": data
+    })
 
 @csrf_exempt
 def add_category(request):
     if request.method != "POST":
-        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
-    
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "POST method required."
+            },
+            status=405
+        )
+
     try:
         data = json.loads(request.body)
+
         name = data.get("name", "").strip()
+        yield_percentage = data.get(
+            "approx_yield_percentage",
+            0
+        )
+
         if not name:
-            return JsonResponse({"success": False, "message": "Category name is required."}, status=400)
-            
-        category, created = Category.objects.get_or_create(name=name)
-        if not created and not category.is_active:
-            category.is_active = True
+            return JsonResponse(
+                {
+                    "success": False,
+                    "message": "Category name is required."
+                },
+                status=400
+            )
+
+        try:
+            yield_percentage = Decimal(
+                str(yield_percentage)
+            )
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError
+        ):
+            return JsonResponse(
+                {
+                    "success": False,
+                    "message": "Invalid yield percentage."
+                },
+                status=400
+            )
+
+        if yield_percentage < 0 or yield_percentage > 100:
+            return JsonResponse(
+                {
+                    "success": False,
+                    "message": (
+                        "Yield percentage must be "
+                        "between 0 and 100."
+                    )
+                },
+                status=400
+            )
+
+        category, created = Category.objects.get_or_create(
+            name=name,
+            defaults={
+                "approx_yield_percentage": yield_percentage
+            }
+        )
+
+        if not created:
+
+            if not category.is_active:
+                category.is_active = True
+
+            category.approx_yield_percentage = yield_percentage
             category.save()
-            
-        return JsonResponse({"success": True, "message": "Category added.", "category": {"id": category.id, "name": category.name}})
+
+        return JsonResponse({
+            "success": True,
+            "message": "Category added.",
+            "category": {
+                "id": category.id,
+                "name": category.name,
+                "approx_yield_percentage": float(
+                    category.approx_yield_percentage
+                )
+            }
+        })
+
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Invalid JSON data."
+            },
+            status=400
+        )
+
     except Exception as e:
-        return JsonResponse({"success": False, "message": str(e)}, status=400)
+        return JsonResponse(
+            {
+                "success": False,
+                "message": str(e)
+            },
+            status=400
+        )
+
+@csrf_exempt
+def update_category(request, category_id):
+    if request.method != "PUT":
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "PUT method required."
+            },
+            status=405
+        )
+
+    try:
+        category = Category.objects.get(id=category_id)
+
+        data = json.loads(request.body)
+
+        name = data.get("name")
+        yield_percentage = data.get(
+            "approx_yield_percentage"
+        )
+
+        if name is not None:
+            name = name.strip()
+
+            if not name:
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": "Category name is required."
+                    },
+                    status=400
+                )
+
+            category.name = name
+
+        if yield_percentage is not None:
+            try:
+                yield_percentage = Decimal(
+                    str(yield_percentage)
+                )
+            except (
+                InvalidOperation,
+                ValueError,
+                TypeError
+            ):
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": "Invalid yield percentage."
+                    },
+                    status=400
+                )
+
+            if yield_percentage < 0 or yield_percentage > 100:
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": (
+                            "Yield percentage must be "
+                            "between 0 and 100."
+                        )
+                    },
+                    status=400
+                )
+
+            category.approx_yield_percentage = yield_percentage
+
+        category.save()
+
+        return JsonResponse({
+            "success": True,
+            "message": "Category updated successfully.",
+            "category": {
+                "id": category.id,
+                "name": category.name,
+                "approx_yield_percentage": float(
+                    category.approx_yield_percentage
+                )
+            }
+        })
+
+    except Category.DoesNotExist:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Category not found."
+            },
+            status=404
+        )
+
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Invalid JSON data."
+            },
+            status=400
+        )
+
+    except Exception as e:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": str(e)
+            },
+            status=400
+        )
 
 @csrf_exempt
 def delete_category(request, category_id):
@@ -1491,6 +1815,715 @@ def get_date_range(period):
         return start.replace(hour=0, minute=0, second=0, microsecond=0), now
     return None, None
 
+
+
+
+def get_production_yield_report(request):
+    """
+    Production report for Admin.
+
+    Filters orders by delivery date and returns:
+    - Overall production summary
+    - Category-wise production
+    - Individual order/item production details
+    """
+
+    if request.method != "GET":
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "GET method required."
+            },
+            status=405
+        )
+
+    date_param = request.GET.get("date", "").strip()
+
+    # ---------------------------------------
+    # Validate date
+    # ---------------------------------------
+
+    if not date_param:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Date is required."
+            },
+            status=400
+        )
+
+    try:
+        report_date = datetime.strptime(
+            date_param,
+            "%Y-%m-%d"
+        ).date()
+
+    except ValueError:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Invalid date format. Use YYYY-MM-DD."
+            },
+            status=400
+        )
+
+    # ---------------------------------------
+    # Get orders for selected delivery date
+    # ---------------------------------------
+
+    orders = (
+        Order.objects
+        .filter(delivery_date=report_date)
+        .select_related("customer")
+        .prefetch_related("items")
+        .order_by("-created_at")
+    )
+
+    # ---------------------------------------
+    # Overall totals
+    # ---------------------------------------
+
+    total_received = Decimal("0.00")
+    total_expected_meat = Decimal("0.00")
+    total_meat = Decimal("0.00")
+    total_waste = Decimal("0.00")
+
+    # ---------------------------------------
+    # Category totals
+    # ---------------------------------------
+
+    category_data = {}
+
+    # ---------------------------------------
+    # Individual order data
+    # ---------------------------------------
+
+    order_data = []
+
+    for order in orders:
+
+        order_items = []
+
+        for item in order.items.all():
+
+            received = (
+                Decimal(str(item.received_quantity))
+                if item.received_quantity is not None
+                else Decimal("0.00")
+            )
+
+            meat = (
+                Decimal(str(item.meat_delivered))
+                if item.meat_delivered is not None
+                else Decimal("0.00")
+            )
+
+            waste = (
+                Decimal(str(item.waste_quantity))
+                if item.waste_quantity is not None
+                else Decimal("0.00")
+            )
+
+            approx_yield = (
+                Decimal(str(item.approx_yield_percentage))
+                if item.approx_yield_percentage is not None
+                else Decimal("0.00")
+            )
+
+            # ---------------------------------------
+            # Expected Meat
+            # ---------------------------------------
+
+            expected_meat = (
+                received * approx_yield / Decimal("100")
+            )
+
+            # ---------------------------------------
+            # Actual Yield
+            # ---------------------------------------
+
+            actual_yield = Decimal("0.00")
+
+            if received > 0:
+                actual_yield = (
+                    meat / received
+                ) * Decimal("100")
+
+            # ---------------------------------------
+            # Overall totals
+            # ---------------------------------------
+
+            total_received += received
+            total_expected_meat += expected_meat
+            total_meat += meat
+            total_waste += waste
+
+            # ---------------------------------------
+            # Category-wise totals
+            # ---------------------------------------
+
+            category_name = (
+                item.chicken_type.strip()
+                if item.chicken_type
+                else "Unknown"
+            )
+
+            if category_name not in category_data:
+                category_data[category_name] = {
+                    "category": category_name,
+                    "approx_yield_percentage": approx_yield,
+                    "total_received": Decimal("0.00"),
+                    "total_expected_meat": Decimal("0.00"),
+                    "total_meat": Decimal("0.00"),
+                    "total_waste": Decimal("0.00"),
+                }
+
+            category_data[category_name]["total_received"] += received
+            category_data[category_name]["total_expected_meat"] += expected_meat
+            category_data[category_name]["total_meat"] += meat
+            category_data[category_name]["total_waste"] += waste
+
+            # ---------------------------------------
+            # Individual order item
+            # ---------------------------------------
+
+            order_items.append({
+                "id": item.id,
+                "category": category_name,
+
+                "raw_received": float(
+                    received.quantize(Decimal("0.01"))
+                ),
+
+                "approx_yield_percentage": float(
+                    approx_yield.quantize(Decimal("0.01"))
+                ),
+
+                "expected_meat": float(
+                    expected_meat.quantize(Decimal("0.01"))
+                ),
+
+                "actual_meat": float(
+                    meat.quantize(Decimal("0.01"))
+                ),
+
+                "actual_yield_percentage": float(
+                    actual_yield.quantize(Decimal("0.01"))
+                ),
+
+                "waste": float(
+                    waste.quantize(Decimal("0.01"))
+                ),
+            })
+
+        # ---------------------------------------
+        # Individual order
+        # ---------------------------------------
+
+        order_data.append({
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "customer_id": order.customer.id,
+            "customer": order.customer.customer_name,
+            "delivery_date": order.delivery_date.isoformat(),
+            "status": order.status,
+            "items": order_items,
+        })
+
+    # ---------------------------------------
+    # Overall actual yield
+    # ---------------------------------------
+
+    overall_actual_yield = Decimal("0.00")
+
+    if total_received > 0:
+        overall_actual_yield = (
+            total_meat / total_received
+        ) * Decimal("100")
+
+    # ---------------------------------------
+    # Build category response
+    # ---------------------------------------
+
+    categories_response = []
+
+    for category in category_data.values():
+
+        category_received = category["total_received"]
+        category_meat = category["total_meat"]
+
+        category_actual_yield = Decimal("0.00")
+
+        if category_received > 0:
+            category_actual_yield = (
+                category_meat / category_received
+            ) * Decimal("100")
+
+        categories_response.append({
+            "category": category["category"],
+
+            "approx_yield_percentage": float(
+                category["approx_yield_percentage"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_received": float(
+                category_received.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_expected_meat": float(
+                category["total_expected_meat"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_meat": float(
+                category_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "actual_yield_percentage": float(
+                category_actual_yield.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_waste": float(
+                category["total_waste"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+        })
+
+    return JsonResponse({
+        "success": True,
+
+        "date": report_date.isoformat(),
+
+        "summary": {
+            "total_received": float(
+                total_received.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_expected_meat": float(
+                total_expected_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_meat": float(
+                total_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "total_waste": float(
+                total_waste.quantize(
+                    Decimal("0.01")
+                )
+            ),
+
+            "actual_yield_percentage": float(
+                overall_actual_yield.quantize(
+                    Decimal("0.01")
+                )
+            ),
+        },
+
+        "categories": categories_response,
+
+        "orders": order_data,
+    })
+
+
+
+
+
+def get_monthly_production_yield_report(request):
+    """
+    Monthly production yield report.
+
+    Query parameter:
+        month=YYYY-MM
+
+    Returns:
+        - Monthly overall summary
+        - Daily production totals
+        - Category-wise monthly totals
+        - Order/item details
+    """
+
+    if request.method != "GET":
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "GET method required."
+            },
+            status=405
+        )
+
+    month_param = request.GET.get("month", "").strip()
+
+    if not month_param:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Month is required. Use YYYY-MM."
+            },
+            status=400
+        )
+
+    # --------------------------------------------------
+    # Validate month
+    # --------------------------------------------------
+
+    try:
+        report_month = datetime.strptime(
+            month_param,
+            "%Y-%m"
+        ).date()
+
+    except ValueError:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Invalid month format. Use YYYY-MM."
+            },
+            status=400
+        )
+
+    year = report_month.year
+    month = report_month.month
+
+    # --------------------------------------------------
+    # Get orders for selected month
+    # --------------------------------------------------
+
+    orders = (
+        Order.objects
+        .filter(
+            delivery_date__year=year,
+            delivery_date__month=month
+        )
+        .select_related("customer")
+        .prefetch_related("items")
+        .order_by("delivery_date", "-created_at")
+    )
+
+    # --------------------------------------------------
+    # Monthly totals
+    # --------------------------------------------------
+
+    total_received = Decimal("0.00")
+    total_expected_meat = Decimal("0.00")
+    total_meat = Decimal("0.00")
+    total_waste = Decimal("0.00")
+
+    # --------------------------------------------------
+    # Category totals
+    # --------------------------------------------------
+
+    category_data = {}
+
+    # --------------------------------------------------
+    # Daily totals
+    # --------------------------------------------------
+
+    daily_data = {}
+
+    # --------------------------------------------------
+    # Orders
+    # --------------------------------------------------
+
+    order_data = []
+
+    for order in orders:
+
+        order_items = []
+
+        order_date = order.delivery_date.isoformat()
+
+        if order_date not in daily_data:
+            daily_data[order_date] = {
+                "date": order_date,
+                "total_received": Decimal("0.00"),
+                "total_expected_meat": Decimal("0.00"),
+                "total_meat": Decimal("0.00"),
+                "total_waste": Decimal("0.00"),
+            }
+
+        for item in order.items.all():
+
+            received = (
+                Decimal(str(item.received_quantity))
+                if item.received_quantity is not None
+                else Decimal("0.00")
+            )
+
+            meat = (
+                Decimal(str(item.meat_delivered))
+                if item.meat_delivered is not None
+                else Decimal("0.00")
+            )
+
+            waste = (
+                Decimal(str(item.waste_quantity))
+                if item.waste_quantity is not None
+                else Decimal("0.00")
+            )
+
+            approx_yield = (
+                Decimal(str(item.approx_yield_percentage))
+                if item.approx_yield_percentage is not None
+                else Decimal("0.00")
+            )
+
+            # Expected meat
+            expected_meat = (
+                received * approx_yield / Decimal("100")
+            )
+
+            # Actual yield
+            actual_yield = Decimal("0.00")
+
+            if received > 0:
+                actual_yield = (
+                    meat / received
+                ) * Decimal("100")
+
+            # --------------------------------------------------
+            # Monthly totals
+            # --------------------------------------------------
+
+            total_received += received
+            total_expected_meat += expected_meat
+            total_meat += meat
+            total_waste += waste
+
+            # --------------------------------------------------
+            # Daily totals
+            # --------------------------------------------------
+
+            daily_data[order_date]["total_received"] += received
+            daily_data[order_date]["total_expected_meat"] += expected_meat
+            daily_data[order_date]["total_meat"] += meat
+            daily_data[order_date]["total_waste"] += waste
+
+            # --------------------------------------------------
+            # Category
+            # --------------------------------------------------
+
+            category_name = (
+                item.chicken_type.strip()
+                if item.chicken_type
+                else "Unknown"
+            )
+
+            if category_name not in category_data:
+                category_data[category_name] = {
+                    "category": category_name,
+                    "approx_yield_percentage": approx_yield,
+                    "total_received": Decimal("0.00"),
+                    "total_expected_meat": Decimal("0.00"),
+                    "total_meat": Decimal("0.00"),
+                    "total_waste": Decimal("0.00"),
+                }
+
+            category_data[category_name]["total_received"] += received
+            category_data[category_name]["total_expected_meat"] += expected_meat
+            category_data[category_name]["total_meat"] += meat
+            category_data[category_name]["total_waste"] += waste
+
+            # --------------------------------------------------
+            # Order item
+            # --------------------------------------------------
+
+            order_items.append({
+                "id": item.id,
+                "category": category_name,
+                "raw_received": float(
+                    received.quantize(Decimal("0.01"))
+                ),
+                "approx_yield_percentage": float(
+                    approx_yield.quantize(Decimal("0.01"))
+                ),
+                "expected_meat": float(
+                    expected_meat.quantize(Decimal("0.01"))
+                ),
+                "actual_meat": float(
+                    meat.quantize(Decimal("0.01"))
+                ),
+                "actual_yield_percentage": float(
+                    actual_yield.quantize(Decimal("0.01"))
+                ),
+                "waste": float(
+                    waste.quantize(Decimal("0.01"))
+                ),
+            })
+
+        order_data.append({
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "customer_id": order.customer.id,
+            "customer": order.customer.customer_name,
+            "delivery_date": order.delivery_date.isoformat(),
+            "status": order.status,
+            "items": order_items,
+        })
+
+    # --------------------------------------------------
+    # Overall actual yield
+    # --------------------------------------------------
+
+    overall_actual_yield = Decimal("0.00")
+
+    if total_received > 0:
+        overall_actual_yield = (
+            total_meat / total_received
+        ) * Decimal("100")
+
+    # --------------------------------------------------
+    # Category response
+    # --------------------------------------------------
+
+    categories_response = []
+
+    for category in category_data.values():
+
+        category_received = category["total_received"]
+        category_meat = category["total_meat"]
+
+        category_actual_yield = Decimal("0.00")
+
+        if category_received > 0:
+            category_actual_yield = (
+                category_meat / category_received
+            ) * Decimal("100")
+
+        categories_response.append({
+            "category": category["category"],
+            "approx_yield_percentage": float(
+                category["approx_yield_percentage"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_received": float(
+                category_received.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_expected_meat": float(
+                category["total_expected_meat"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_meat": float(
+                category_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "actual_yield_percentage": float(
+                category_actual_yield.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_waste": float(
+                category["total_waste"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+        })
+
+    # --------------------------------------------------
+    # Daily response
+    # --------------------------------------------------
+
+    daily_response = []
+
+    for day in sorted(daily_data.values(), key=lambda x: x["date"]):
+
+        day_received = day["total_received"]
+        day_meat = day["total_meat"]
+
+        day_actual_yield = Decimal("0.00")
+
+        if day_received > 0:
+            day_actual_yield = (
+                day_meat / day_received
+            ) * Decimal("100")
+
+        daily_response.append({
+            "date": day["date"],
+            "total_received": float(
+                day_received.quantize(Decimal("0.01"))
+            ),
+            "total_expected_meat": float(
+                day["total_expected_meat"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_meat": float(
+                day_meat.quantize(Decimal("0.01"))
+            ),
+            "actual_yield_percentage": float(
+                day_actual_yield.quantize(Decimal("0.01"))
+            ),
+            "total_waste": float(
+                day["total_waste"].quantize(
+                    Decimal("0.01")
+                )
+            ),
+        })
+
+    # --------------------------------------------------
+    # Final response
+    # --------------------------------------------------
+
+    return JsonResponse({
+        "success": True,
+
+        "month": report_month.strftime("%Y-%m"),
+
+        "summary": {
+            "total_received": float(
+                total_received.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_expected_meat": float(
+                total_expected_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_meat": float(
+                total_meat.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "actual_yield_percentage": float(
+                overall_actual_yield.quantize(
+                    Decimal("0.01")
+                )
+            ),
+            "total_waste": float(
+                total_waste.quantize(
+                    Decimal("0.01")
+                )
+            ),
+        },
+
+        "daily": daily_response,
+
+        "categories": categories_response,
+
+        "orders": order_data,
+    })
 # --- Dashboard & Reports APIs ---
 
 def get_dashboard_stats(request):
@@ -1686,4 +2719,4 @@ def clear_notifications(request):
         
     Notification.objects.all().delete()
     return JsonResponse({"success": True, "message": "All notifications cleared."})
-
+

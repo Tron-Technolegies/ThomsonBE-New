@@ -580,20 +580,45 @@ def get_accounts_customers(request):
 
 def get_dashboard_stats(request):
     if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-        
-    target_date = request.GET.get('date')
-    
+        return JsonResponse({
+            "success": False,
+            "message": "GET method required."
+        }, status=405)
+
+    target_date = request.GET.get("date")
+
     inv_qs = Invoice.objects.all()
     ord_qs = Order.objects.all()
+
     if target_date:
         inv_qs = inv_qs.filter(created_at__date=target_date)
         ord_qs = ord_qs.filter(created_at__date=target_date)
-        
-    total_revenue = inv_qs.aggregate(Sum('total_amount'))['total_amount__sum'] or Decimal('0.00')
+
+    # Total revenue
+    total_revenue = (
+        inv_qs.aggregate(Sum("total_amount"))["total_amount__sum"]
+        or Decimal("0.00")
+    )
+
+    # Total orders
     total_orders = ord_qs.count()
-    outstanding = inv_qs.exclude(status='Paid').aggregate(Sum('remaining_amount'))['remaining_amount__sum'] or Decimal('0.00')
-    total_customers = Customer.objects.filter(status='active').count()
+
+    # Outstanding balance
+    # remaining_amount is a Python property, not a DB field,
+    # so it cannot be used with Sum().
+    unpaid_invoices = (
+        inv_qs
+        .filter(status__in=["Unpaid", "Partial"])
+        .prefetch_related("payments")
+    )
+
+    outstanding = Decimal("0.00")
+
+    for invoice in unpaid_invoices:
+        outstanding += Decimal(str(invoice.remaining_amount))
+
+    # Total active customers
+    total_customers = Customer.objects.filter(status="active").count()
 
     return JsonResponse({
         "success": True,

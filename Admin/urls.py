@@ -24,6 +24,7 @@ urlpatterns = [
     
     path("categories/", views.get_categories, name="get_categories"),
     path("categories/add/", views.add_category, name="add_category"),
+    path("categories/<int:category_id>/update/",views.update_category,name="update_category"),
     path("categories/<int:category_id>/delete/", views.delete_category, name="delete_category"),
 
     path("accounts/orders/", views.get_accounts_orders, name="get_accounts_orders"),
@@ -39,6 +40,8 @@ urlpatterns = [
     path("dashboard/stats/", views.get_dashboard_stats, name="get_dashboard_stats"),
     path("dashboard/charts/", views.get_dashboard_charts, name="get_dashboard_charts"),
     path("dashboard/recent-orders/", views.get_recent_orders, name="get_recent_orders"),
+    path("production-yield/",views.get_production_yield_report,name="get_production_yield_report"),
+    path("production-yield/monthly/",views.get_monthly_production_yield_report,name="get_monthly_production_yield_report"),
     
     path("reports/customers/", views.get_customer_purchase_report, name="get_customer_purchase_report"),
 

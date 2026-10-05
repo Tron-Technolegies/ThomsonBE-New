@@ -141,6 +141,11 @@ class Customer(models.Model):
 
 class Category(models.Model):
     name = models.CharField(max_length=100, unique=True)
+    approx_yield_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0.00
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -213,6 +218,12 @@ class OrderItem(models.Model):
     chicken_type = models.CharField(max_length=50)
     weight = models.DecimalField(max_digits=10, decimal_places=2)
     price_per_kg = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    approx_yield_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
 
     # Cutting Team Category-wise Tracking Fields
     received_quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
