@@ -559,24 +559,122 @@ def get_advance_balances(request):
         }
     })
 
+
+
 def get_accounts_customers(request):
     if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-    
-    customers = Customer.objects.filter(status='active').order_by('customer_name')
+        return JsonResponse(
+            {"success": False, "message": "GET method required."},
+            status=405,
+        )
+
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    today = timezone.localdate()
+    start_date = today - timedelta(days=29)
+    zero = Decimal("0.00")
+
+    customers = Customer.objects.filter(
+        status="active"
+    ).order_by("customer_name")
+
     data = []
+
     for c in customers:
+        # Use the same scoring logic as the Admin page.
+        score = c.performance_score
+        category = c.performance_category
+
+        # All invoices for this customer's current outstanding balance.
+        invoices = list(
+            Invoice.objects.filter(
+                order__customer=c
+            ).prefetch_related("payments")
+        )
+
+        outstanding_balance = zero
+
+        for invoice in invoices:
+            outstanding_balance += max(
+                zero,
+                invoice.remaining_amount,
+            )
+
+        # Purchases during the last 30 calendar days.
+        recent_invoices = [
+            invoice
+            for invoice in invoices
+            if start_date <= timezone.localdate(
+                invoice.created_at
+            ) <= today
+        ]
+
+        recent_purchases = sum(
+            (invoice.total_amount for invoice in recent_invoices),
+            zero,
+        )
+
+        recent_paid = sum(
+            (
+                max(
+                    zero,
+                    invoice.total_amount - invoice.remaining_amount,
+                )
+                for invoice in recent_invoices
+            ),
+            zero,
+        )
+
+        payment_performance = (
+            (recent_paid / recent_purchases) * Decimal("100")
+            if recent_purchases > zero
+            else zero
+        )
+
+        # Advance balance across all customer transactions.
+        total_advances = (
+            AdvancePayment.objects.filter(customer=c).aggregate(
+                total=Sum("amount")
+            )["total"]
+            or zero
+        )
+
+        total_advance_used = (
+            Invoice.objects.filter(
+                order__customer=c
+            ).aggregate(total=Sum("advance_used"))["total"]
+            or zero
+        )
+
         data.append({
             "id": c.id,
             "customer_name": c.customer_name,
             "company_name": c.company_name,
-            "phone": c.phone
+            "phone": c.phone,
+
+            "performance_score": score,
+            "performance_category": category,
+
+            "recent_purchases": float(recent_purchases),
+            "payment_performance": round(
+                float(payment_performance), 2
+            ),
+            "outstanding_balance": float(outstanding_balance),
+
+            "total_advances": float(total_advances),
+            "total_advance_used": float(total_advance_used),
+            "advance_balance": float(
+                total_advances - total_advance_used
+            ),
         })
-        
+
     return JsonResponse({
         "success": True,
-        "customers": data
+        "customers": data,
     })
+
 
 def get_dashboard_stats(request):
     if request.method != "GET":
@@ -627,7 +725,6 @@ def get_dashboard_stats(request):
         "customers": total_customers,
         "outstanding": float(outstanding)
     })
-
 def get_dashboard_charts(request):
     if request.method != "GET":
         return JsonResponse({"success": False, "message": "GET method required."}, status=405)

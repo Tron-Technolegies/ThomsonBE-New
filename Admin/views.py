@@ -202,6 +202,11 @@ def view_all_customers(request):
     customer_list = []
 
     for customer in customers:
+
+        # Calculate the score once for this customer
+        score = customer.performance_score
+        category = Customer.category_for_score(score)
+
         customer_list.append(
             {
                 "id": customer.id,
@@ -214,9 +219,12 @@ def view_all_customers(request):
                 "customer_type": customer.customer_type,
                 "status": customer.status,
                 "address": customer.address,
-                "performance_score": customer.performance_score,
+                "performance_score": score,
+                "performance_category": category,
                 "total_orders": customer.total_orders,
-                "total_purchase_volume": float(customer.total_purchase_volume or 0),
+                "total_purchase_volume": float(
+                    customer.total_purchase_volume or 0
+                ),
                 "created_at": customer.created_at,
                 "updated_at": customer.updated_at
             }
@@ -255,6 +263,9 @@ def view_single_customer(request, customer_id):
             },
             status=404
         )
+
+    score = customer.performance_score
+    category = Customer.category_for_score(score)
 
     invoices = Invoice.objects.filter(order__customer=customer).order_by('-created_at')
     advances = AdvancePayment.objects.filter(customer=customer).order_by('-created_at')
@@ -331,7 +342,8 @@ def view_single_customer(request, customer_id):
                 "customer_type": customer.customer_type,
                 "status": customer.status,
                 "address": customer.address,
-                "performance_score": customer.performance_score,
+                "performance_score": score,
+                "performance_category": category,
                 "created_at": customer.created_at,
                 "updated_at": customer.updated_at,
                 "purchase_history": purchase_history,
@@ -2656,6 +2668,8 @@ def get_customer_purchase_report(request):
     
     from .models import OrderItem
     for c in customers:
+        score = c.performance_score
+        category = Customer.category_for_score(score)
         orders = Order.objects.filter(customer=c)
         order_items = OrderItem.objects.filter(order__customer=c)
         invoices = Invoice.objects.filter(order__customer=c)
@@ -2678,7 +2692,9 @@ def get_customer_purchase_report(request):
             "phone": c.phone,
             "total_orders": total_orders,
             "total_weight": total_weight,
-            "total_spent": float(total_spent)
+            "total_spent": float(total_spent),
+            "performance_score": score,
+            "performance_category": category,
         })
         
     return JsonResponse({"success": True, "customers_report": data})

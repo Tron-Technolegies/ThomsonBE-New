@@ -61,83 +61,126 @@ class Customer(models.Model):
 
     @property
     def performance_score(self):
-        from .models import OrderItem, Invoice
-        from django.utils import timezone
+        from datetime import timedelta
         from decimal import Decimal
-        from django.db.models import Sum
+        from django.utils import timezone
+        from .models import Invoice
 
-        score = 0
-        
-        # 1. Purchase Volume (Max 30 points)
-        # Cap at 500kg for max points
-        total_weight = OrderItem.objects.filter(order__customer=self).aggregate(Sum('weight'))['weight__sum'] or Decimal('0.00')
-        volume_points = min(30, (float(total_weight) / 500.0) * 30)
-        score += volume_points
-        
-        # 2. Purchase Frequency (Max 30 points)
-        # Cap at 20 orders for max points
-        order_count = self.orders.count()
-        freq_points = min(30, (order_count / 20.0) * 30)
-        score += freq_points
-        
-        # 3. Payment Clearance & Timing (Max 40 points)
-        invoices = Invoice.objects.filter(order__customer=self)
-        if not invoices.exists():
-            # Neutral payment score for new customers
-            score += 40
-            return int(max(0, min(100, score)))
-            
-        total_billed = sum(inv.total_amount for inv in invoices)
-        if total_billed == Decimal('0.00'):
-            score += 40
-            return int(max(0, min(100, score)))
-            
-        # Total Paid
-        total_unpaid = sum(inv.remaining_amount for inv in invoices)
-        total_paid = float(total_billed) - float(total_unpaid)
-        
-        # Ratio points (Max 20 points)
-        ratio_points = (total_paid / float(total_billed)) * 20
-        score += max(0, min(20, ratio_points))
-        
-        # Clearance Timing (Max 20 points)
-        paid_invoices = [inv for inv in invoices if inv.status == "Paid"]
-        if paid_invoices:
-            total_days = 0
-            count = 0
-            for inv in paid_invoices:
-                last_payment = inv.payments.order_by('-created_at').first()
-                if last_payment:
-                    days = (last_payment.created_at - inv.created_at).days
-                    total_days += max(0, days)
-                    count += 1
-            
-            if count > 0:
-                avg_days = total_days / count
-                if avg_days <= 3:
-                    score += 20
-                elif avg_days <= 7:
-                    score += 15
-                elif avg_days <= 15:
-                    score += 10
-                elif avg_days <= 30:
-                    score += 5
-            else:
-                # Fully paid via advances maybe
-                score += 20
-                
-        # Deduct points for severely overdue invoices
-        now = timezone.now()
-        overdue_invoices = [inv for inv in invoices if inv.status in ["Unpaid", "Partial"]]
-        overdue_points = 0
-        for inv in overdue_invoices:
-            days_unpaid = (now - inv.created_at).days
-            if days_unpaid > 30:
-                overdue_points += 5
-        
-        score -= overdue_points
-        
-        return int(max(0, min(100, score)))
+        today = timezone.localdate()
+        start_date = today - timedelta(days=29)
+        zero = Decimal("0.00")
+
+        # 1. Purchases during the last 30 calendar days
+        recent_invoices = list(
+            Invoice.objects.filter(
+                order__customer=self,
+                created_at__date__gte=start_date,
+                created_at__date__lte=today,
+            ).prefetch_related("payments")
+        )
+
+        total_purchased = sum(
+            (invoice.total_amount for invoice in recent_invoices),
+            zero,
+        )
+
+        # Paid amount for those invoices, including advances applied
+        # to invoices. Avoid counting the same advance separately.
+        total_paid = sum(
+            (
+                max(
+                    zero,
+                    invoice.total_amount - invoice.remaining_amount,
+                )
+                for invoice in recent_invoices
+            ),
+            zero,
+        )
+
+        # 2. Current outstanding balance across all customer invoices
+        all_invoices = Invoice.objects.filter(
+            order__customer=self
+        ).prefetch_related("payments")
+
+        outstanding = sum(
+            (
+                max(zero, invoice.remaining_amount)
+                for invoice in all_invoices
+            ),
+            zero,
+        )
+
+        # 3. Average daily purchase over the 30-day period
+        daily_purchase = total_purchased / Decimal("30")
+
+        # 4. Payment performance (0-100)
+        if total_purchased > zero:
+            payment_score = min(
+                Decimal("100"),
+                (total_paid / total_purchased) * Decimal("100"),
+            )
+        else:
+            payment_score = zero
+
+        # 5. Sales volume score (client formula)
+        denominator = daily_purchase + outstanding / Decimal("30")
+
+        if denominator > zero:
+            volume_score = (
+                daily_purchase / denominator
+            ) * Decimal("100")
+        else:
+            volume_score = zero
+
+        # 6. Working-capital score (client formula)
+        risk_denominator = outstanding + daily_purchase * Decimal("30")
+
+        if risk_denominator > zero:
+            working_capital_score = (
+                daily_purchase * Decimal("30") / risk_denominator
+            ) * Decimal("100")
+        else:
+            working_capital_score = zero
+
+        # 7. Weighted final score
+        final_score = (
+            Decimal("0.40") * volume_score
+            + Decimal("0.40") * payment_score
+            + Decimal("0.20") * working_capital_score
+        )
+
+        return int(
+            max(
+                zero,
+                min(Decimal("100"), final_score),
+            )
+        )
+
+    @staticmethod
+    def category_for_score(score):
+        if score >= 85:
+            return "Excellent"
+        elif score >= 70:
+            return "Good"
+        elif score >= 55:
+            return "Watch Carefully"
+        elif score >= 40:
+            return "Reduce Credit"
+        return "High Risk"
+
+    @property
+    def performance_category(self):
+        score = self.performance_score
+
+        if score >= 85:
+            return "Excellent"
+        elif score >= 70:
+            return "Good"
+        elif score >= 55:
+            return "Watch Carefully"
+        elif score >= 40:
+            return "Reduce Credit"
+        return "High Risk"
 
 class Category(models.Model):
     name = models.CharField(max_length=100, unique=True)
