@@ -1,6 +1,6 @@
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.permissions import IsAuthenticated, IsAdminUser, BasePermission
 from rest_framework.response import Response
 from django.contrib.auth.models import User
 from .models import StaffProfile
@@ -29,8 +29,34 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
+
+
+
+class IsStaffAdministrator(BasePermission):
+    message = "Only administrators can manage staff accounts."
+
+    def has_permission(self, request, view):
+        user = request.user
+
+        if (
+            not user
+            or not user.is_authenticated
+            or not user.is_active
+        ):
+            return False
+
+        if user.is_superuser:
+            return True
+
+        profile = getattr(user, "staff_profile", None)
+
+        return bool(
+            profile and profile.role == "admin"
+        )
+
+
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsStaffAdministrator])
 def get_staff_list(request):
     staff_profiles = StaffProfile.objects.all().select_related('user')
     data = []
@@ -47,7 +73,7 @@ def get_staff_list(request):
     return Response(data)
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsStaffAdministrator])
 def create_staff(request):
     data = request.data
     try:
@@ -70,7 +96,7 @@ def create_staff(request):
         return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['PUT'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsStaffAdministrator])
 def update_staff(request, user_id):
     try:
         user = User.objects.get(id=user_id)
@@ -99,7 +125,7 @@ def update_staff(request, user_id):
         return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsStaffAdministrator])
 def delete_staff(request, user_id):
     try:
         user = User.objects.get(id=user_id)

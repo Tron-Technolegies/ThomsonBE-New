@@ -9,7 +9,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, date, timedelta
 from django.utils import timezone
-from decimal import Decimal,InvalidOperation
+from decimal import Decimal,InvalidOperation, ROUND_HALF_UP
 from django.views.decorators.http import require_http_methods
 import json
 
@@ -1427,125 +1427,360 @@ def save_order_pricing(request, order_id):
     except Exception as e:
         return JsonResponse({"success": False, "message": str(e)}, status=400)
 
+
 @csrf_exempt
 def create_invoice(request):
     if request.method != "POST":
-        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+        return JsonResponse(
+            {"success": False, "message": "POST method required."},
+            status=405
+        )
 
     try:
         data = json.loads(request.body)
-        order_id = data.get('order_id')
-        gst_type = data.get('gst_type', 'fixed')
-        gst_input_val = data.get('gst_input', 0)
-        
-        try:
-            gst_input = Decimal(str(gst_input_val))
-        except (ValueError, TypeError, Exception):
-            gst_input = Decimal('0.00')
+
+        order_id = data.get("order_id")
+        gst_type = data.get("gst_type", "fixed")
+        gst_input_raw = data.get("gst_input", 0)
 
         if not order_id:
-            return JsonResponse({"success": False, "message": "order_id is required."}, status=400)
+            return JsonResponse(
+                {"success": False, "message": "Order ID is required."},
+                status=400
+            )
+
+        # Pricing date: use the supplied date or today
+        pricing_date_raw = data.get("pricing_date")
+
+        if pricing_date_raw:
+            try:
+                pricing_date = datetime.strptime(
+                    pricing_date_raw, "%Y-%m-%d"
+                ).date()
+            except (ValueError, TypeError):
+                return JsonResponse(
+                    {"success": False, "message": "Invalid pricing date. Use YYYY-MM-DD."},
+                    status=400
+                )
+        else:
+            pricing_date = timezone.localdate()
+
+        # Validate GST
+        if gst_type not in ["percentage", "fixed"]:
+            return JsonResponse(
+                {"success": False, "message": "Invalid GST type."},
+                status=400
+            )
+
+        try:
+            gst_input = Decimal(str(gst_input_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            return JsonResponse(
+                {"success": False, "message": "Invalid GST value."},
+                status=400
+            )
+
+        if not gst_input.is_finite() or gst_input < 0:
+            return JsonResponse(
+                {"success": False, "message": "GST cannot be negative or invalid."},
+                status=400
+            )
+
+        gst_input = gst_input.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
 
         with transaction.atomic():
-            # Validate Order
+
+            # 1. Fetch and lock the order
             order = Order.objects.select_for_update().get(id=order_id)
-            
-            # Lock the customer to prevent concurrent advance consumption
-            customer = Customer.objects.select_for_update().get(id=order.customer_id)
-            
-            # Duplicate protection
-            if hasattr(order, 'invoice'):
-                return JsonResponse({"success": False, "message": "Invoice already exists for this order."}, status=400)
 
-            items = order.items.all()
-            if not items.exists():
-                return JsonResponse({"success": False, "message": "Order has no items."}, status=400)
+            # Lock customer to prevent concurrent advance consumption
+            customer = Customer.objects.select_for_update().get(
+                id=order.customer_id
+            )
 
-            # Validate prices and calculate subtotal using Decimal
-            subtotal = Decimal('0.00')
+            # 2. Prevent duplicate invoices
+            if hasattr(order, "invoice"):
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": "Invoice already exists for this order."
+                    },
+                    status=400
+                )
+
+            # 3. Fetch order items
+            items = list(order.items.all())
+
+            if not items:
+                return JsonResponse(
+                    {"success": False, "message": "Order has no items."},
+                    status=400
+                )
+
+            # 4. Fetch daily live prices for the selected date
+            daily_prices = DailyPrice.objects.select_for_update().filter(
+                date=pricing_date
+            )
+
+            # Normalize chicken type names for matching
+            price_map = {}
+
+            for daily_price in daily_prices:
+                key = daily_price.chicken_type.strip().casefold()
+                price_map.setdefault(key, daily_price.price)
+
+            if not price_map:
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": (
+                            f"No daily prices found for {pricing_date}. "
+                            "Please update daily prices before generating the invoice."
+                        )
+                    },
+                    status=400
+                )
+
+            # 5. Calculate meat rate and item subtotal
+            subtotal = Decimal("0.00")
+            calculated_items = []
+
             for item in items:
-                if item.price_per_kg is None or Decimal(str(item.price_per_kg)) < Decimal('0.00'):
-                    return JsonResponse({"success": False, "message": f"Missing or invalid price for item: {item.chicken_type}"}, status=400)
-                if item.weight is None or Decimal(str(item.weight)) <= Decimal('0.00'):
-                    return JsonResponse({"success": False, "message": f"Invalid weight for item: {item.chicken_type}"}, status=400)
+
+                chicken_type = (item.chicken_type or "").strip()
+                price_key = chicken_type.casefold()
+
+                # Validate daily live rate
                 
-                item_subtotal = Decimal(str(item.weight)) * Decimal(str(item.price_per_kg))
+                live_rate_raw = (
+                    customer.live_rate
+                    if customer.live_rate is not None
+                    else price_map.get(price_key)
+                )
+
+
+                if live_rate_raw is None:
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": (
+                                f"Daily live rate is missing for {chicken_type} "
+                                f"on {pricing_date}."
+                            )
+                        },
+                        status=400
+                    )
+
+                live_rate = Decimal(str(live_rate_raw))
+
+                if not live_rate.is_finite() or live_rate <= 0:
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": f"Invalid live rate for {chicken_type}."
+                        },
+                        status=400
+                    )
+
+                # Validate ordered weight
+                if item.weight is None:
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": f"Weight is missing for {chicken_type}."
+                        },
+                        status=400
+                    )
+
+                weight = Decimal(str(item.weight))
+
+                if not weight.is_finite() or weight <= 0:
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": f"Invalid weight for {chicken_type}."
+                        },
+                        status=400
+                    )
+
+                # Validate yield percentage snapshot
+                if item.approx_yield_percentage is None:
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": (
+                                f"Yield percentage is missing for {chicken_type}. "
+                                "Please update the category yield percentage."
+                            )
+                        },
+                        status=400
+                    )
+
+                yield_percentage = Decimal(
+                    str(item.approx_yield_percentage)
+                )
+
+                if (
+                    not yield_percentage.is_finite()
+                    or yield_percentage <= 0
+                    or yield_percentage > 100
+                ):
+                    return JsonResponse(
+                        {
+                            "success": False,
+                            "message": f"Invalid yield percentage for {chicken_type}."
+                        },
+                        status=400
+                    )
+
+                # Meat Rate = Live Rate / (Yield Percentage / 100)
+                meat_rate = (
+                    live_rate * Decimal("100") / yield_percentage
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+
+                # Item Subtotal = Weight × Meat Rate
+                item_subtotal = (
+                    weight * meat_rate
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+
                 subtotal += item_subtotal
 
-            # Quantize subtotal to 2 decimal places
-            subtotal = subtotal.quantize(Decimal('0.01'))
+                calculated_items.append({
+                    "order_item": item,
+                    "chicken_type": chicken_type,
+                    "weight": weight,
+                    "live_rate": live_rate,
+                    "yield_percentage": yield_percentage,
+                    "meat_rate": meat_rate,
+                    "subtotal": item_subtotal
+                })
 
-            # Calculate GST using Decimal
-            if gst_type == 'percentage':
-                calculated_gst_amount = subtotal * (gst_input / Decimal('100.00'))
+            subtotal = subtotal.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            # 6. Calculate GST
+            if gst_type == "percentage":
+                calculated_gst_amount = (
+                    subtotal * gst_input / Decimal("100")
+                )
             else:
                 calculated_gst_amount = gst_input
-                
-            calculated_gst_amount = calculated_gst_amount.quantize(Decimal('0.01'))
 
-            total_amount = subtotal + calculated_gst_amount
+            calculated_gst_amount = calculated_gst_amount.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
 
-            # Calculate Customer's available advance balance
-            total_advances = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))['amount__sum'] or Decimal('0.00')
-            total_used = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))['advance_used__sum'] or Decimal('0.00')
-            available_advance = Decimal(str(total_advances)) - Decimal(str(total_used))
+            total_amount = (
+                subtotal + calculated_gst_amount
+            ).quantize(Decimal("0.01"))
 
-            advance_to_use = Decimal('0.00')
-            status = 'Unpaid'
+            # 7. Calculate available customer advance
+            total_advances = (
+                AdvancePayment.objects.filter(customer=customer)
+                .aggregate(Sum("amount"))["amount__sum"]
+                or Decimal("0.00")
+            )
 
-            if available_advance > Decimal('0.00'):
+            total_used = (
+                Invoice.objects.filter(order__customer=customer)
+                .aggregate(Sum("advance_used"))["advance_used__sum"]
+                or Decimal("0.00")
+            )
+
+            available_advance = (
+                Decimal(str(total_advances))
+                - Decimal(str(total_used))
+            )
+
+            advance_to_use = Decimal("0.00")
+            status = "Unpaid"
+
+            if available_advance > 0:
                 if available_advance >= total_amount:
                     advance_to_use = total_amount
-                    status = 'Paid'
+                    status = "Paid"
                 else:
                     advance_to_use = available_advance
-                    status = 'Partial'
+                    status = "Partial"
 
-            # Create Invoice
+            # 8. Create invoice
             invoice = Invoice.objects.create(
                 order=order,
+                pricing_mode="live_rate",
+                pricing_date=pricing_date,
+                entered_rate=None,
                 gst_type=gst_type,
                 gst_input=gst_input,
                 calculated_gst_amount=calculated_gst_amount,
                 total_amount=total_amount,
                 advance_used=advance_to_use,
                 status=status,
-                # Legacy fields for compatibility
-                selling_price_per_kg=Decimal('0.00'), 
+
+                # Legacy compatibility
+                selling_price_per_kg=Decimal("0.00"),
                 gst_amount=calculated_gst_amount
             )
 
-            # Create InvoiceItem snapshots
+            # 9. Save invoice item snapshots
             invoice_items_data = []
-            for item in items:
+
+            for calculated_item in calculated_items:
+
+                item = calculated_item["order_item"]
+
                 ii = InvoiceItem.objects.create(
                     invoice=invoice,
                     order_item=item,
-                    chicken_type_snapshot=item.chicken_type,
-                    weight_snapshot=item.weight,
-                    selling_price_per_kg_snapshot=item.price_per_kg
+                    chicken_type_snapshot=calculated_item["chicken_type"],
+                    weight_snapshot=calculated_item["weight"],
+                    selling_price_per_kg_snapshot=calculated_item["meat_rate"],
+                    live_rate_snapshot=calculated_item["live_rate"],
+                    yield_percentage_snapshot=calculated_item["yield_percentage"],
+                    subtotal_snapshot=calculated_item["subtotal"]
                 )
-                item_subtotal = Decimal(str(ii.weight_snapshot)) * Decimal(str(ii.selling_price_per_kg_snapshot))
+
                 invoice_items_data.append({
                     "chicken_type": ii.chicken_type_snapshot,
-                    "weight": str(ii.weight_snapshot),
-                    "selling_price_per_kg": str(ii.selling_price_per_kg_snapshot),
-                    "subtotal": float(item_subtotal.quantize(Decimal('0.01')))
+                    "weight": float(ii.weight_snapshot),
+                    "live_rate": float(calculated_item["live_rate"]),
+                    "yield_percentage": float(calculated_item["yield_percentage"]),
+                    "meat_rate": float(ii.selling_price_per_kg_snapshot),
+                    "subtotal": float(calculated_item["subtotal"])
                 })
 
-            # The Notification model from the existing codebase expects 'type', 'title', 'description'
+            # 10. Create notification
             Notification.objects.create(
                 type="invoice",
                 title="Invoice Generated",
-                description=f"Invoice {invoice.invoice_number} created for {customer.customer_name}."
+                description=(
+                    f"Invoice {invoice.invoice_number} created "
+                    f"for {customer.customer_name}."
+                )
             )
 
-            remaining_amount = total_amount - advance_to_use
+            remaining_amount = (
+                total_amount - advance_to_use
+            ).quantize(Decimal("0.01"))
 
+            # 11. Response
             response_data = {
                 "id": invoice.id,
                 "invoice_number": invoice.invoice_number,
                 "order_id": order.id,
+                "pricing_mode": invoice.pricing_mode,
+                "pricing_date": str(invoice.pricing_date),
                 "items": invoice_items_data,
                 "subtotal": float(subtotal),
                 "gst_type": gst_type,
@@ -1557,14 +1792,35 @@ def create_invoice(request):
                 "status": status
             }
 
-            return JsonResponse({"success": True, "invoice": response_data})
+            return JsonResponse({
+                "success": True,
+                "invoice": response_data
+            })
 
     except Order.DoesNotExist:
-        return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+        return JsonResponse(
+            {"success": False, "message": "Order not found."},
+            status=404
+        )
+
     except Customer.DoesNotExist:
-        return JsonResponse({"success": False, "message": "Customer not found."}, status=404)
+        return JsonResponse(
+            {"success": False, "message": "Customer not found."},
+            status=404
+        )
+
+    except (InvalidOperation, ValueError, TypeError) as e:
+        return JsonResponse(
+            {"success": False, "message": f"Invalid invoice data: {str(e)}"},
+            status=400
+        )
+
     except Exception as e:
-        return JsonResponse({"success": False, "message": str(e)}, status=400)
+        return JsonResponse(
+            {"success": False, "message": str(e)},
+            status=400
+        )
+
 
 
 # --- Advance APIs ---
@@ -1713,17 +1969,24 @@ def get_all_invoices(request):
     for inv in invoices:
         balance_due = float(inv.remaining_amount)
         
+
         data.append({
             "id": inv.invoice_number,
+            "invoice_id": inv.pk,
+            "invoice_number": inv.invoice_number,
             "customer": inv.order.customer.customer_name,
             "date": inv.created_at.strftime("%d %b %Y"),
-            "amount": float(inv.total_amount - inv.calculated_gst_amount),
+            "amount": float(
+                inv.total_amount - inv.calculated_gst_amount
+            ),
             "tax": float(inv.calculated_gst_amount),
             "total": float(inv.total_amount),
             "advance_used": float(inv.advance_used),
+            "advance": float(inv.advance_used),
             "balance": balance_due,
             "status": inv.status
         })
+
 
     return JsonResponse({"success": True, "invoices": data})
 
@@ -2736,3 +2999,89 @@ def clear_notifications(request):
     Notification.objects.all().delete()
     return JsonResponse({"success": True, "message": "All notifications cleared."})
 
+
+
+
+@require_http_methods(["GET"])
+def get_customer_live_rate(request, customer_id):
+    try:
+        customer = Customer.objects.get(pk=customer_id)
+
+        return JsonResponse({
+            "success": True,
+            "customer_id": customer.id,
+            "live_rate": (
+                float(customer.live_rate)
+                if customer.live_rate is not None
+                else None
+            )
+        })
+
+    except Customer.DoesNotExist:
+        return JsonResponse({
+            "success": False,
+            "message": "Customer not found."
+        }, status=404)
+
+
+@csrf_exempt
+@require_http_methods(["PUT"])
+def update_customer_live_rate(request, customer_id):
+    try:
+        customer = Customer.objects.get(pk=customer_id)
+
+        try:
+            data = json.loads(request.body)
+        except (ValueError, TypeError):
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid JSON data."
+            }, status=400)
+
+        if "live_rate" not in data:
+            return JsonResponse({
+                "success": False,
+                "message": "Live Rate field is required."
+            }, status=400)
+
+        rate_value = data["live_rate"]
+
+        if rate_value is None or rate_value == "":
+            customer.live_rate = None
+        else:
+            try:
+                rate = Decimal(str(rate_value))
+            except (InvalidOperation, TypeError, ValueError):
+                return JsonResponse({
+                    "success": False,
+                    "message": "Invalid Live Rate."
+                }, status=400)
+
+            if not rate.is_finite() or rate < 0:
+                return JsonResponse({
+                    "success": False,
+                    "message": "Live Rate must be non-negative."
+                }, status=400)
+
+            customer.live_rate = rate.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+        customer.save(update_fields=["live_rate"])
+
+        return JsonResponse({
+            "success": True,
+            "message": "Customer Live Rate updated successfully.",
+            "live_rate": (
+                float(customer.live_rate)
+                if customer.live_rate is not None
+                else None
+            )
+        })
+
+    except Customer.DoesNotExist:
+        return JsonResponse({
+            "success": False,
+            "message": "Customer not found."
+        }, status=404)

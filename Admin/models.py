@@ -20,6 +20,13 @@ class Customer(models.Model):
     customer_name = models.CharField(max_length=150)
     company_name = models.CharField(max_length=200)
 
+    live_rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+
     contact_person = models.CharField(
         max_length=150,
         blank=True,
@@ -291,6 +298,21 @@ class DailyPrice(models.Model):
         return f"{self.chicken_type} - {self.date} - ₹{self.price}"
 
 
+class DailyLivePrice(models.Model):
+    date = models.DateField(unique=True)
+    live_rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=2
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Live Rate - {self.date} - ₹{self.live_rate}"
+
+
+
 class Invoice(models.Model):
     STATUS_CHOICES = [
         ("Unpaid", "Unpaid"),
@@ -302,6 +324,14 @@ class Invoice(models.Model):
         ("percentage", "Percentage"),
         ("fixed", "Fixed Amount"),
     ]
+
+
+    PRICING_MODE_CHOICES = [
+        ("live_rate", "Live Rate"),
+        ("meat_rate", "Meat Rate"),
+        ("legacy", "Legacy"),
+    ]
+
 
     invoice_number = models.CharField(max_length=20, unique=True, editable=False)
     order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name='invoice')
@@ -319,9 +349,15 @@ class Invoice(models.Model):
     advance_used = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
     
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Unpaid")
+    pricing_date = models.DateField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # Invoice-level pricing configuration
+    pricing_mode = models.CharField(max_length=20,choices=PRICING_MODE_CHOICES,default="legacy")
+    # Original rate entered while generating the invoice
+    entered_rate = models.DecimalField(max_digits=10,decimal_places=2,null=True,blank=True)
 
     def save(self, *args, **kwargs):
         if not self.invoice_number:
@@ -369,6 +405,13 @@ class InvoiceItem(models.Model):
     chicken_type_snapshot = models.CharField(max_length=50)
     weight_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
     selling_price_per_kg_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
+
+    # Save the yield percentage used for this invoice
+    yield_percentage_snapshot = models.DecimalField(max_digits=5,decimal_places=2,null=True,blank=True)
+    subtotal_snapshot = models.DecimalField(max_digits=12,decimal_places=2,null=True,blank=True)
+    live_rate_snapshot = models.DecimalField(max_digits=10,decimal_places=2,null=True,blank=True)
+
+
 
     def __str__(self):
         return f"{self.invoice.invoice_number} - {self.chicken_type_snapshot}"

@@ -57,4 +57,8 @@ urlpatterns = [
     path('staff/create/', auth_views.create_staff, name='create_staff'),
     path('staff/<int:user_id>/update/', auth_views.update_staff, name='update_staff'),
     path('staff/<int:user_id>/delete/', auth_views.delete_staff, name='delete_staff'),
+
+    path("customers/<int:customer_id>/live-rate/",views.get_customer_live_rate,name="get_customer_live_rate"),
+    path("customers/<int:customer_id>/live-rate/update/",views.update_customer_live_rate,name="update_customer_live_rate"),
+
 ]

@@ -1,16 +1,22 @@
-from Admin.models import Invoice, Order, OrderItem, InvoiceItem, AdvancePayment, InvoicePayment, Customer, DailyPrice
+from unittest import result
+
+from Admin.models import Invoice, Order, OrderItem, InvoiceItem, AdvancePayment, InvoicePayment, Customer, DailyPrice,Category,CustomerCategoryPrice
 from django.http import JsonResponse, HttpResponse
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 import json
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.db import transaction
 from django.db.models import Sum, Count, F
 from django.utils import timezone
 from datetime import timedelta
 from django.views.decorators.csrf import csrf_exempt
+
+from collections import defaultdict
+from decimal import Decimal
+
 
 def get_accounts_invoices(request):
     if request.method != "GET":
@@ -61,8 +67,10 @@ def get_accounts_invoices(request):
 
         data.append({
             "id": i.invoice_number,
+            "invoice_id": i.id,
             "order_id": i.order.order_number,
             "customer": i.order.customer.customer_name,
+            "customer_address": i.order.customer.address or "",
             "date": i.created_at.strftime("%d %b %Y"),
             "delivery_date": i.order.delivery_date.strftime("%d %b %Y"),
             "amount": float(i.total_amount - i.calculated_gst_amount),
@@ -140,155 +148,512 @@ def get_outstanding_invoices(request):
         }
     })
 
+
 def get_purchase_orders(request):
     if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+        return JsonResponse({
+            "success": False,
+            "message": "GET method required."
+        }, status=405)
 
-    orders = Order.objects.filter(status__in=['Ready', 'Delivered']).prefetch_related('items', 'customer').order_by('-created_at')
 
-    target_date = request.GET.get('date')
+    orders = (
+        Order.objects
+        .filter(status__in=["Ready", "Delivered"])
+        .prefetch_related("items")
+        .select_related("customer", "invoice")
+        .order_by("-created_at")
+    )
+
+    target_date = request.GET.get("date")
+
     if target_date:
         orders = orders.filter(delivery_date=target_date)
 
     order_list = []
+
     for order in orders:
         items_list = []
-        total_weight = 0.0
-        
+        total_weight = Decimal("0.00")
+
         for oi in order.items.all():
-            weight = float(oi.weight) if oi.weight else 0.0
+
+            weight = (
+                Decimal(str(oi.weight))
+                if oi.weight is not None
+                else Decimal("0.00")
+            )
+
             total_weight += weight
+            yield_percentage = oi.approx_yield_percentage
+
+        # Fetch current category yield if the order item has no valid yield
+            if (
+                yield_percentage is None
+                or Decimal(str(yield_percentage)) <= 0
+            ):
+                yield_percentage = Category.objects.filter(
+                    name__iexact=oi.chicken_type
+                ).values_list(
+                    "approx_yield_percentage",
+                    flat=True
+                ).first()
+
             items_list.append({
                 "id": oi.id,
                 "chicken_type": oi.chicken_type,
                 "weight": str(oi.weight),
-                "price_per_kg": float(oi.price_per_kg) if oi.price_per_kg else None
+
+                "price_per_kg": (
+                    float(oi.price_per_kg)
+                    if oi.price_per_kg is not None
+                    else None
+                ),
+
+                # Yield percentage required by invoice frontend
+                "approx_yield_percentage": (
+                    float(yield_percentage)
+                    if yield_percentage is not None
+                    else None
+                )
             })
 
         order_list.append({
             "id": order.id,
             "order_number": order.order_number,
             "customer": order.customer.customer_name,
+            "customer_id": order.customer_id,  # ADD THIS
             "delivery_date": order.delivery_date.strftime("%d %b %Y"),
             "status": order.status,
             "items": items_list,
-            "total_weight": total_weight
+            "total_weight": float(total_weight),
+            "is_priced": hasattr(order, "invoice"),
         })
 
     return JsonResponse({
-        "success": True, 
+        "success": True,
         "count": len(order_list),
         "orders": order_list
     })
 
+
+
 @csrf_exempt
 @transaction.atomic
 def create_invoice(request):
+
     if request.method != "POST":
-        return JsonResponse({"success": False, "message": "POST method required."}, status=405)
+        return JsonResponse({
+            "success": False,
+            "message": "POST method required."
+        }, status=405)
 
     try:
-        data = json.loads(request.body)
+        data = json.loads(request.body or "{}")
+
         order_id = data.get("order_id")
+        pricing_mode = data.get("pricing_mode", "live_rate")
         gst_type = data.get("gst_type", "percentage")
         gst_input_raw = data.get("gst_input", 0)
 
-        if not order_id:
-            return JsonResponse({"success": False, "message": "Order ID is required."}, status=400)
+        # Validate pricing mode
+        if pricing_mode not in ["live_rate", "meat_rate"]:
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid pricing mode."
+            }, status=400)
 
-        # 1. Fetch Order
+        if not order_id:
+            return JsonResponse({
+                "success": False,
+                "message": "Order ID is required."
+            }, status=400)
+
+        # Validate GST
+        try:
+            gst_input = Decimal(str(gst_input_raw)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            if not gst_input.is_finite() or gst_input < 0:
+                raise InvalidOperation
+
+        except (InvalidOperation, TypeError, ValueError):
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid GST value."
+            }, status=400)
+
+        if gst_type not in ["percentage", "fixed"]:
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid GST type."
+            }, status=400)
+
+        # Pricing date
+        pricing_date = timezone.localdate()
+
+        # Get and lock order
         try:
             order = Order.objects.select_for_update().get(id=order_id)
         except Order.DoesNotExist:
-            return JsonResponse({"success": False, "message": "Order not found."}, status=404)
+            return JsonResponse({
+                "success": False,
+                "message": "Order not found."
+            }, status=404)
 
-        # Validate order status
         if order.status not in ["Ready", "Delivered"]:
-            return JsonResponse({"success": False, "message": f"Cannot generate invoice for order in {order.status} status."}, status=400)
+            return JsonResponse({
+                "success": False,
+                "message": f"Cannot generate invoice for order in {order.status} status."
+            }, status=400)
 
-        # 2. Check for existing invoice
-        if hasattr(order, 'invoice'):
-            return JsonResponse({"success": False, "message": "Invoice already exists for this order."}, status=400)
+        # Prevent duplicate invoices
+        if hasattr(order, "invoice"):
+            return JsonResponse({
+                "success": False,
+                "message": "Invoice already exists for this order."
+            }, status=400)
 
-        # 3. Validate items and calculate subtotal
-        items = order.items.all()
+        items = list(order.items.all())
+        # Read invoice-level rate overrides from the frontend.
+        item_rates_payload = data.get("item_rates", [])
+
+        if not isinstance(item_rates_payload, list):
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid item rates data."
+            }, status=400)
+
+        submitted_rates = {}
+        submitted_meat_rates = {}
+
+        for rate_data in item_rates_payload:
+            if not isinstance(rate_data, dict):
+                return JsonResponse({
+                    "success": False,
+                    "message": "Invalid item rate entry."
+                }, status=400)
+
+            item_id = str(rate_data.get("order_item_id", ""))
+
+            if not item_id or item_id in submitted_rates:
+                return JsonResponse({
+                    "success": False,
+                    "message": "Invalid or duplicate order item rate."
+                }, status=400)
+
+            submitted_rates[item_id] = rate_data.get("live_rate")
+
+            manual_meat_rate = rate_data.get("meat_rate")
+
+            if manual_meat_rate is not None:
+                try:
+                    manual_meat_rate = Decimal(
+                        str(manual_meat_rate)
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP
+                    )
+
+                    if (
+                        not manual_meat_rate.is_finite()
+                        or manual_meat_rate <= 0
+                    ):
+                        raise ValueError()
+
+                except (ValueError, TypeError, InvalidOperation):
+                    return JsonResponse({
+                        "success": False,
+                        "message": "Invalid manual Meat Rate."
+                    }, status=400)
+
+                submitted_meat_rates[item_id] = manual_meat_rate
+
+
+        valid_item_ids = {str(item.id) for item in items}
+
+        if set(submitted_rates) - valid_item_ids:
+            return JsonResponse({
+                "success": False,
+                "message": "An invalid order item was submitted."
+            }, status=400)
+
+        # Fetch customer-specific rates.
+        customer_price_map = {
+            str(price.category.name).strip().casefold(): price.price
+            for price in CustomerCategoryPrice.objects.filter(
+                customer=order.customer
+            ).select_related("category")
+        }
+
         if not items:
-            return JsonResponse({"success": False, "message": "Order has no items."}, status=400)
+            return JsonResponse({
+                "success": False,
+                "message": "Order has no items."
+            }, status=400)
 
-        subtotal = Decimal('0.00')
+        # Fetch Daily Prices for the exact pricing date
+        daily_prices = DailyPrice.objects.filter(
+            date=pricing_date
+        ).order_by("-updated_at")
+
+        price_map = {}
+
+        for daily_price in daily_prices:
+            key = str(daily_price.chicken_type).strip().casefold()
+
+            if key and key not in price_map:
+                price_map[key] = daily_price.price
+
+        # Calculate each order item
+        subtotal = Decimal("0.00")
+        calculated_items = []
+
         for item in items:
-            if item.price_per_kg is None or item.price_per_kg < 0:
-                return JsonResponse({"success": False, "message": f"Item {item.chicken_type} missing valid selling price."}, status=400)
-            
-            weight = Decimal(str(item.weight))
-            price = Decimal(str(item.price_per_kg))
-            subtotal += (weight * price)
 
-        # 4. Calculate GST
-        try:
-            gst_input = Decimal(str(gst_input_raw))
-        except:
-            return JsonResponse({"success": False, "message": "Invalid GST value."}, status=400)
+            chicken_type = str(item.chicken_type).strip()
+            key = chicken_type.casefold()
 
-        if gst_type not in ["percentage", "fixed"]:
-            return JsonResponse({"success": False, "message": "Invalid GST type."}, status=400)
+            # Get Daily Live Rate
+            if str(item.id) in submitted_rates:
+                live_rate_raw = submitted_rates[str(item.id)]
 
+            elif key in customer_price_map:
+                live_rate_raw = customer_price_map[key]
+
+            else:
+                live_rate_raw = price_map.get(key)
+
+            if live_rate_raw is None:
+                return JsonResponse({
+                    "success": False,
+                    "message": (
+                        f"No customer-specific or daily Live Rate "
+                        f"found for {chicken_type}."
+                    )
+                }, status=400)
+
+            live_rate = Decimal(str(live_rate_raw)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            if not live_rate.is_finite() or live_rate <= 0:
+                return JsonResponse({
+                    "success": False,
+                    "message": f"Invalid Daily Live Rate for {chicken_type}."
+                }, status=400)
+
+            # Get and validate weight
+            weight = Decimal(str(item.weight)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            if not weight.is_finite() or weight <= 0:
+                return JsonResponse({
+                    "success": False,
+                    "message": f"Invalid weight for {chicken_type}."
+                }, status=400)
+
+            # Get Yield Percentage
+            yield_percentage_raw = item.approx_yield_percentage
+
+            if (
+                yield_percentage_raw is None
+                or Decimal(str(yield_percentage_raw)) <= 0
+            ):
+                yield_percentage_raw = Category.objects.filter(
+                    name__iexact=chicken_type
+                ).values_list(
+                    "approx_yield_percentage",
+                    flat=True
+                ).first()
+
+            yield_percentage = None
+
+            if yield_percentage_raw is not None:
+                yield_percentage = Decimal(str(yield_percentage_raw))
+
+                if (
+                    not yield_percentage.is_finite()
+                    or yield_percentage <= 0
+                    or yield_percentage > 100
+                ):
+                    yield_percentage = None
+
+            # LIVE RATE MODE
+            if pricing_mode == "live_rate":
+
+                selected_rate = live_rate
+                meat_rate = None
+
+            # MEAT RATE MODE
+
+            # MEAT RATE MODE
+            else:
+                manual_meat_rate = submitted_meat_rates.get(
+                    str(item.id)
+                )
+
+                if manual_meat_rate is not None:
+                    # Use manually entered Meat Rate
+                    meat_rate = manual_meat_rate
+
+                else:
+                    # Keep existing automatic calculation
+                    if yield_percentage is None:
+                        return JsonResponse({
+                            "success": False,
+                            "message": (
+                                f"Valid Yield Percentage is required "
+                                f"for {chicken_type}."
+                            )
+                        }, status=400)
+
+                    meat_rate = (
+                        live_rate * Decimal("100") / yield_percentage
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP
+                    )
+
+                selected_rate = meat_rate
+
+
+            # Calculate item subtotal
+            item_subtotal = (
+                weight * selected_rate
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            subtotal += item_subtotal
+
+            calculated_items.append({
+                "order_item": item,
+                "chicken_type": chicken_type,
+                "weight": weight,
+                "live_rate": live_rate,
+                "yield_percentage": yield_percentage,
+                "meat_rate": meat_rate,
+                "selected_rate": selected_rate,
+                "subtotal": item_subtotal,
+            })
+
+        subtotal = subtotal.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        # Calculate GST
         if gst_type == "percentage":
-            calculated_gst_amount = subtotal * (gst_input / Decimal('100.00'))
+            calculated_gst_amount = (
+                subtotal * gst_input / Decimal("100")
+            )
         else:
             calculated_gst_amount = gst_input
 
-        # Quantize GST
-        calculated_gst_amount = calculated_gst_amount.quantize(Decimal('0.01'))
-        
-        total_amount = subtotal + calculated_gst_amount
+        calculated_gst_amount = calculated_gst_amount.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
 
-        # 5. Advance Application (with lock on customer advances)
+        total_amount = (
+            subtotal + calculated_gst_amount
+        ).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        # Calculate available customer advance
         customer = order.customer
-        
-        # Calculate total advances
-        adv_agg = AdvancePayment.objects.filter(customer=customer).aggregate(Sum('amount'))
-        total_advances = adv_agg['amount__sum'] or Decimal('0.00')
 
-        # Calculate total used advances
-        inv_agg = Invoice.objects.filter(order__customer=customer).aggregate(Sum('advance_used'))
-        total_used = inv_agg['advance_used__sum'] or Decimal('0.00')
+        total_advances = (
+            AdvancePayment.objects
+            .filter(customer=customer)
+            .aggregate(Sum("amount"))["amount__sum"]
+            or Decimal("0.00")
+        )
+
+        total_used = (
+            Invoice.objects
+            .filter(order__customer=customer)
+            .aggregate(Sum("advance_used"))["advance_used__sum"]
+            or Decimal("0.00")
+        )
 
         available_advance = total_advances - total_used
-        
-        advance_used = Decimal('0.00')
-        if available_advance > Decimal('0.00'):
-            advance_used = min(available_advance, total_amount)
 
-        # 6. Determine Status
+        advance_used = Decimal("0.00")
+
+        if available_advance > 0:
+            advance_used = min(
+                available_advance,
+                total_amount
+            )
+
+        # Determine invoice status
         remaining_amount = total_amount - advance_used
-        if remaining_amount <= Decimal('0.00'):
+
+        if remaining_amount <= 0:
             status = "Paid"
-        elif advance_used > Decimal('0.00'):
+        elif advance_used > 0:
             status = "Partial"
         else:
             status = "Unpaid"
 
-        # 7. Create Invoice
+        # Create Invoice
         invoice = Invoice.objects.create(
             order=order,
+            pricing_mode=pricing_mode,
+            pricing_date=pricing_date,
+            entered_rate=None,
             gst_type=gst_type,
             gst_input=gst_input,
+            gst_amount=calculated_gst_amount,
             calculated_gst_amount=calculated_gst_amount,
             total_amount=total_amount,
             advance_used=advance_used,
             status=status
         )
 
-        # 8. Create InvoiceItems (Snapshot)
-        for item in items:
-            InvoiceItem.objects.create(
+        # Save invoice items and snapshots
+        invoice_items = []
+
+        for row in calculated_items:
+
+            invoice_item = InvoiceItem.objects.create(
                 invoice=invoice,
-                order_item=item,
-                chicken_type_snapshot=item.chicken_type,
-                weight_snapshot=item.weight,
-                selling_price_per_kg_snapshot=item.price_per_kg
+                order_item=row["order_item"],
+                chicken_type_snapshot=row["chicken_type"],
+                weight_snapshot=row["weight"],
+                selling_price_per_kg_snapshot=row["selected_rate"],
+                live_rate_snapshot=row["live_rate"],
+                yield_percentage_snapshot=row["yield_percentage"],
+                subtotal_snapshot=row["subtotal"]
             )
+
+            invoice_items.append({
+                "chicken_type": invoice_item.chicken_type_snapshot,
+                "weight": float(invoice_item.weight_snapshot),
+                "live_rate": float(row["live_rate"]),
+                "yield_percentage": (
+                    float(row["yield_percentage"])
+                    if row["yield_percentage"] is not None
+                    else None
+                ),
+                "meat_rate": (
+                    float(row["meat_rate"])
+                    if row["meat_rate"] is not None
+                    else None
+                ),
+                "selected_rate": float(row["selected_rate"]),
+                "subtotal": float(row["subtotal"])
+            })
 
         return JsonResponse({
             "success": True,
@@ -297,19 +662,26 @@ def create_invoice(request):
                 "id": invoice.id,
                 "invoice_number": invoice.invoice_number,
                 "order_id": order.id,
-                "subtotal": float(subtotal.quantize(Decimal('0.01'))),
-                "gst_type": invoice.gst_type,
-                "gst_input": float(invoice.gst_input),
-                "gst_amount": float(invoice.calculated_gst_amount),
-                "total_amount": float(invoice.total_amount),
-                "advance_used": float(invoice.advance_used),
-                "remaining_amount": float(remaining_amount.quantize(Decimal('0.01'))),
-                "status": invoice.status
+                "pricing_mode": invoice.pricing_mode,
+                "pricing_date": str(invoice.pricing_date),
+                "items": invoice_items,
+                "subtotal": float(subtotal),
+                "gst_type": gst_type,
+                "gst_input": float(gst_input),
+                "gst_amount": float(calculated_gst_amount),
+                "total_amount": float(total_amount),
+                "advance_used": float(advance_used),
+                "remaining_amount": float(remaining_amount),
+                "status": status
             }
         })
 
     except Exception as e:
-        return JsonResponse({"success": False, "message": str(e)}, status=500)
+        return JsonResponse({
+            "success": False,
+            "message": str(e)
+        }, status=500)
+
 
 @csrf_exempt
 @transaction.atomic
@@ -878,80 +1250,369 @@ def get_advance_analytics(request, customer_id):
         "monthly_summary": monthly_summary
     })
 
+
+
+
 def get_sales_report(request):
     if request.method != "GET":
-        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
-        
+        return JsonResponse({
+            "success": False,
+            "message": "GET method required."
+        }, status=405)
+
+
     target_date_str = request.GET.get('date')
-    period = request.GET.get('period', 'Daily') # Daily, Weekly, Monthly
-    
-    invoices = Invoice.objects.select_related('order', 'order__customer').order_by('-created_at')
-    
+    period = request.GET.get('period', 'Daily')
+
+    # NEW: Custom date range
+    from_date_str = request.GET.get('from_date')
+    to_date_str = request.GET.get('to_date')
+
+    invoices = (
+        Invoice.objects
+        .select_related('order', 'order__customer')
+        .prefetch_related('items', 'payments')
+        .order_by('-created_at')
+    )
+
     if target_date_str:
         try:
-            target_date = timezone.datetime.strptime(target_date_str, "%Y-%m-%d").date()
-        except:
-            target_date = timezone.now().date()
+            target_date = timezone.datetime.strptime(
+                target_date_str, "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid date format. Use YYYY-MM-DD."
+            }, status=400)
     else:
-        target_date = timezone.now().date()
-        
-    if period == 'Daily':
-        invoices = invoices.filter(created_at__date=target_date)
+        target_date = timezone.localdate()
+
+    # Date filtering
+
+    # Date filtering
+    if from_date_str or to_date_str:
+        # Both dates are required for custom filtering
+        if not from_date_str or not to_date_str:
+            return JsonResponse({
+                "success": False,
+                "message": "Both From Date and To Date are required."
+            }, status=400)
+
+        try:
+            from_date = timezone.datetime.strptime(
+                from_date_str, "%Y-%m-%d"
+            ).date()
+
+            to_date = timezone.datetime.strptime(
+                to_date_str, "%Y-%m-%d"
+            ).date()
+
+        except ValueError:
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid date format. Use YYYY-MM-DD."
+            }, status=400)
+
+        if from_date > to_date:
+            return JsonResponse({
+                "success": False,
+                "message": "From Date cannot be after To Date."
+            }, status=400)
+
+        # Include both start and end dates
+        invoices = invoices.filter(
+            created_at__date__range=(from_date, to_date)
+        )
+
+    elif period == 'Daily':
+        invoices = invoices.filter(
+            created_at__date=target_date
+        )
+
     elif period == 'Weekly':
-        start_of_week = target_date - timedelta(days=target_date.weekday())
+        start_of_week = target_date - timedelta(
+            days=target_date.weekday()
+        )
         end_of_week = start_of_week + timedelta(days=6)
-        invoices = invoices.filter(created_at__date__gte=start_of_week, created_at__date__lte=end_of_week)
+
+        invoices = invoices.filter(
+            created_at__date__range=(
+                start_of_week, end_of_week
+            )
+        )
+
     elif period == 'Monthly':
-        invoices = invoices.filter(created_at__year=target_date.year, created_at__month=target_date.month)
-    
-    total_revenue = invoices.aggregate(Sum('total_amount'))['total_amount__sum'] or Decimal('0.00')
+        invoices = invoices.filter(
+            created_at__year=target_date.year,
+            created_at__month=target_date.month
+        )
+
+
+    # Existing summary calculations
+    total_revenue = (
+        invoices.aggregate(Sum('total_amount'))['total_amount__sum']
+        or Decimal('0.00')
+    )
+
     total_orders = invoices.count()
-    
+
     sales_list = []
+
+    # Customer-wise grouped transactions
+    customer_groups = defaultdict(lambda: {
+        "customer_code": "",
+        "customer_name": "",
+        "items": [],
+        "receipt": Decimal("0.00"),
+        "balance": Decimal("0.00"),
+    })
+
+
+        # Separate invoice reports by pricing mode
+    pricing_groups = {
+        "live_rate": defaultdict(dict),
+        "meat_rate": defaultdict(dict),
+        "legacy": defaultdict(dict),
+    }
+
+    pricing_totals = {
+        mode: {
+            "quantity": Decimal("0.00"),
+            "total_amount": Decimal("0.00"),
+            "paid_amount": Decimal("0.00"),
+            "balance_amount": Decimal("0.00"),
+        }
+        for mode in pricing_groups
+    }
+
     for inv in invoices:
+        customer = inv.order.customer
+        customer_code = str(customer.id)
+
         sales_list.append({
             "invoice_no": inv.invoice_number,
-            "customer": inv.order.customer.customer_name,
-            "date": inv.created_at.strftime("%d %b %Y, %I:%M %p"),
+            "customer": customer.customer_name,
+            "date": inv.created_at.strftime(
+                "%d %b %Y, %I:%M %p"
+            ),
             "amount": float(inv.total_amount),
             "status": inv.status
         })
-        
+
+        group = customer_groups[customer.id]
+
+        group["customer_code"] = customer_code
+        group["customer_name"] = customer.customer_name
+
+        # Applied advance + payments received against this invoice
+        invoice_payments = sum(
+            (payment.amount for payment in inv.payments.all()),
+            Decimal("0.00")
+        )
+
+        group["receipt"] += (
+            inv.advance_used + invoice_payments
+        )
+
+        group["balance"] += inv.remaining_amount
+
+        # Invoice item details
+        for item in inv.items.all():
+            quantity = item.weight_snapshot or Decimal("0.00")
+            rate = (
+                item.selling_price_per_kg_snapshot
+                or Decimal("0.00")
+            )
+
+            amount = item.subtotal_snapshot
+
+            if amount is None:
+                amount = quantity * rate
+
+            group["items"].append({
+                "item_name": item.chicken_type_snapshot,
+                "quantity": float(quantity),
+                "rate": float(rate),
+                "amount": float(amount),
+                "invoice_no": inv.invoice_number,
+            })
+
+
+
+                    # NEW: Separate Live Rate and Meat Rate purchases
+        mode = inv.pricing_mode or "legacy"
+
+        if mode not in pricing_groups:
+            mode = "legacy"
+
+        mode_customers = pricing_groups[mode]
+
+        if customer.id not in mode_customers:
+            mode_customers[customer.id] = {
+                "customer_code": customer_code,
+                "customer_name": customer.customer_name,
+                "items": [],
+                "quantity": Decimal("0.00"),
+                "total_amount": Decimal("0.00"),
+                "paid_amount": Decimal("0.00"),
+                "balance_amount": Decimal("0.00"),
+            }
+
+        mode_group = mode_customers[customer.id]
+
+        paid = (
+            (inv.advance_used or Decimal("0.00"))
+            + invoice_payments
+        )
+
+        invoice_total = inv.total_amount or Decimal("0.00")
+        balance = invoice_total - paid
+
+        # Financial values are counted once per invoice
+        mode_group["total_amount"] += invoice_total
+        mode_group["paid_amount"] += paid
+        mode_group["balance_amount"] += balance
+
+        pricing_totals[mode]["total_amount"] += invoice_total
+        pricing_totals[mode]["paid_amount"] += paid
+        pricing_totals[mode]["balance_amount"] += balance
+
+        # Add every meat category purchased
+        for item in inv.items.all():
+            quantity = item.weight_snapshot or Decimal("0.00")
+            rate = (
+                item.selling_price_per_kg_snapshot
+                or Decimal("0.00")
+            )
+
+            amount = item.subtotal_snapshot
+            if amount is None:
+                amount = quantity * rate
+
+            mode_group["items"].append({
+                "item_name": item.chicken_type_snapshot,
+                "quantity": float(quantity),
+                "rate": float(rate),
+                "amount": float(amount),
+                "invoice_no": inv.invoice_number,
+            })
+
+            mode_group["quantity"] += quantity
+            pricing_totals[mode]["quantity"] += quantity
+
+    customer_transactions = []
+
+    for group in customer_groups.values():
+        group["receipt"] = float(group["receipt"])
+        group["balance"] = float(group["balance"])
+        customer_transactions.append(group)
+
+    # Existing revenue trend calculation
     revenue_trend = []
+
     if period == 'Monthly':
         for i in range(5, -1, -1):
-            month_start = (target_date.replace(day=1) - timedelta(days=30 * i)).replace(day=1)
-            month_str = month_start.strftime("%b")
-            rev = Invoice.objects.filter(created_at__year=month_start.year, created_at__month=month_start.month).aggregate(Sum('total_amount'))['total_amount__sum'] or Decimal('0.00')
+            month_start = (
+                target_date.replace(day=1) - timedelta(days=30 * i)
+            ).replace(day=1)
+
+            rev = Invoice.objects.filter(
+                created_at__year=month_start.year,
+                created_at__month=month_start.month
+            ).aggregate(
+                Sum('total_amount')
+            )['total_amount__sum'] or Decimal('0.00')
+
             revenue_trend.append({
-                "day": month_str,
+                "day": month_start.strftime("%b"),
                 "revenue": float(rev)
             })
+
     elif period == 'Weekly':
-        start_of_week = target_date - timedelta(days=target_date.weekday())
+        start_of_week = target_date - timedelta(
+            days=target_date.weekday()
+        )
+
         for i in range(6, -1, -1):
             w_start = start_of_week - timedelta(weeks=i)
             w_end = w_start + timedelta(days=6)
-            rev = Invoice.objects.filter(created_at__date__gte=w_start, created_at__date__lte=w_end).aggregate(Sum('total_amount'))['total_amount__sum'] or Decimal('0.00')
+
+            rev = Invoice.objects.filter(
+                created_at__date__gte=w_start,
+                created_at__date__lte=w_end
+            ).aggregate(
+                Sum('total_amount')
+            )['total_amount__sum'] or Decimal('0.00')
+
             revenue_trend.append({
                 "day": w_start.strftime("%d %b"),
                 "revenue": float(rev)
             })
-    else: 
+
+    else:
         for i in range(6, -1, -1):
             day = target_date - timedelta(days=i)
-            rev = Invoice.objects.filter(created_at__date=day).aggregate(Sum('total_amount'))['total_amount__sum'] or Decimal('0.00')
+
+            rev = Invoice.objects.filter(
+                created_at__date=day
+            ).aggregate(
+                Sum('total_amount')
+            )['total_amount__sum'] or Decimal('0.00')
+
             revenue_trend.append({
                 "day": day.strftime("%a"),
                 "revenue": float(rev)
             })
-            
+    def serialize_pricing_groups(mode):
+        result = []
+
+        for customer_data in pricing_groups[mode].values():
+            result.append({
+                **customer_data,
+                "quantity": float(customer_data["quantity"]),
+                "total_amount": float(customer_data["total_amount"]),
+                "paid_amount": float(customer_data["paid_amount"]),
+                "balance_amount": float(customer_data["balance_amount"]),
+            })
+
+        return result
+
+    def serialize_pricing_totals(mode):
+        return {
+            key: float(value)
+            for key, value in pricing_totals[mode].items()
+        }
+
+    report_summary = {
+        "live_rate": serialize_pricing_totals("live_rate"),
+        "meat_rate": serialize_pricing_totals("meat_rate"),
+        "legacy": serialize_pricing_totals("legacy"),
+    }
+
     return JsonResponse({
         "success": True,
+
+        # Existing fields - keep frontend working
         "sales": sales_list,
+        "customer_transactions": customer_transactions,
         "total_revenue": float(total_revenue),
         "total_orders": total_orders,
-        "revenue_trend": revenue_trend
+        "revenue_trend": revenue_trend,
+
+        # NEW: Separated purchases
+        "live_rate_purchases": serialize_pricing_groups(
+            "live_rate"
+        ),
+        "meat_rate_purchases": serialize_pricing_groups(
+            "meat_rate"
+        ),
+        "legacy_purchases": serialize_pricing_groups(
+            "legacy"
+        ),
+
+        # NEW: Section totals
+        "summary": report_summary,
     })
 
 def get_customer_purchase_report(request):
