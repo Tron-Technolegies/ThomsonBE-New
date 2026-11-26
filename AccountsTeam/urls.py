@@ -38,4 +38,9 @@ urlpatterns = [
     
     # Customers
     path('customers/', views.get_accounts_customers, name='accounts_customers'),
+    # Customer-wise outstanding
+    path("outstanding/customers/",views.get_customer_outstanding,name="accounts_customer_outstanding"),
+    # Customer-wise bulk payment
+    path("outstanding/customers/<int:customer_id>/pay/",views.record_customer_bulk_payment,name="accounts_customer_bulk_payment"),
+
 ]

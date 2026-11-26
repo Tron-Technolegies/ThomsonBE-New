@@ -17,6 +17,39 @@ from django.views.decorators.csrf import csrf_exempt
 from collections import defaultdict
 from decimal import Decimal
 
+from django.db.models import Prefetch
+from django.views.decorators.http import require_GET
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework.permissions import BasePermission, IsAuthenticated
+
+
+class CanManageCustomerPayments(BasePermission):
+    message = "Only Admin and Accounts staff can manage payments."
+
+    def has_permission(self, request, view):
+        user = request.user
+
+        if not user or not user.is_authenticated:
+            return False
+
+        if not user.is_active:
+            return False
+
+        if user.is_superuser:
+            return True
+
+        profile = getattr(user, "staff_profile", None)
+
+        return bool(
+            profile and profile.role in ("admin", "accounts")
+        )
+
+
 
 def get_accounts_invoices(request):
     if request.method != "GET":
@@ -1730,98 +1763,553 @@ def _generate_table_pdf(response, title, headers, data_rows, col_widths=None):
     doc.build(elements)
     return response
 
+
+
+from datetime import date, datetime
+
+
+PDF_SORT_OPTIONS = {
+    "newest",
+    "oldest",
+    "az",
+    "za",
+    "high",
+    "low",
+}
+
+
+def sort_pdf_records(
+    records,
+    sort_by="newest",
+    name_key="customer",
+    date_key="date",
+    amount_key="amount",
+):
+    """
+    Sort report records without modifying original data.
+
+    records: list of dictionaries containing:
+        customer/name, date, amount, and PDF row data.
+
+    Does not change invoice or payment calculations.
+    """
+
+    sort_by = (
+        sort_by
+        if sort_by in PDF_SORT_OPTIONS
+        else "newest"
+    )
+
+    result = list(records)
+
+    def name_value(record):
+        return str(
+            record.get(name_key) or ""
+        ).casefold()
+
+    def date_value(record):
+        value = record.get(date_key)
+
+        if isinstance(value, datetime):
+            return value.date().toordinal()
+
+        if isinstance(value, date):
+            return value.toordinal()
+
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(
+                    value[:10]
+                ).toordinal()
+            except ValueError:
+                pass
+
+        return 0
+
+    def amount_value(record):
+        value = record.get(amount_key, 0)
+
+        try:
+            return Decimal(str(value or 0))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0.00")
+
+    if sort_by == "az":
+        result.sort(key=name_value)
+
+    elif sort_by == "za":
+        result.sort(
+            key=name_value,
+            reverse=True
+        )
+
+    elif sort_by == "oldest":
+        result.sort(key=date_value)
+
+    elif sort_by == "newest":
+        result.sort(
+            key=date_value,
+            reverse=True
+        )
+
+    elif sort_by == "high":
+        result.sort(
+            key=amount_value,
+            reverse=True
+        )
+
+    elif sort_by == "low":
+        result.sort(key=amount_value)
+
+    return result
+
+
+
 def export_outstanding_pdf(request):
-    invoices = Invoice.objects.select_related('order', 'order__customer').exclude(status='Paid').order_by('-created_at')
-    response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = 'attachment; filename="Outstanding_Payments.pdf"'
-    
-    headers = ['Invoice No', 'Customer', 'Outstanding', 'Due Date', 'Status']
+    if request.method != "GET":
+        return HttpResponse(
+            "GET method required.",
+            status=405
+        )
+
+    sort_by = request.GET.get(
+        "sort_by", "newest"
+    )
+
+    invoices = (
+        Invoice.objects
+        .select_related(
+            "order",
+            "order__customer"
+        )
+        .exclude(status="Paid")
+        .order_by("id")
+    )
+
+    grouped = {}
+
+    for invoice in invoices:
+        balance = invoice.remaining_amount
+
+        if balance <= Decimal("0.00"):
+            continue
+
+        customer = invoice.order.customer
+        customer_id = customer.id
+
+        delivery_date = invoice.order.delivery_date
+
+        if customer_id not in grouped:
+            grouped[customer_id] = {
+                "customer": customer.customer_name,
+                "company": customer.company_name,
+                "invoice_count": 0,
+                "amount": Decimal("0.00"),
+                "date": delivery_date,
+                "invoice_numbers": [],
+            }
+
+        group = grouped[customer_id]
+
+        group["invoice_count"] += 1
+        group["amount"] += balance
+
+        group["invoice_numbers"].append(
+            str(invoice.invoice_number)
+        )
+
+        # Latest pending invoice delivery date
+        if delivery_date and (
+            group["date"] is None
+            or delivery_date > group["date"]
+        ):
+            group["date"] = delivery_date
+
+    records = sort_pdf_records(
+        grouped.values(),
+        sort_by=sort_by,
+        name_key="customer",
+        date_key="date",
+        amount_key="amount",
+    )
+
+    headers = [
+        "Customer",
+        "Pending Invoices",
+        "Outstanding",
+        "Latest Delivery",
+    ]
+
     rows = []
-    for i in invoices:
-        rem = float(i.remaining_amount)
-        if rem > 0:
-            rows.append([
-                str(i.invoice_number),
-                i.order.customer.customer_name,
-                f"Rs.{rem:.2f}",
-                i.order.delivery_date.strftime("%d %b %Y"),
-                i.status
-            ])
-    return _generate_table_pdf(response, "Outstanding Payments", headers, rows)
+
+    total_outstanding = Decimal("0.00")
+    total_invoices = 0
+
+    for record in records:
+        total_outstanding += record["amount"]
+        total_invoices += record["invoice_count"]
+
+        rows.append([
+            str(record["customer"]),
+            str(record["invoice_count"]),
+            f"Rs.{record['amount']:.2f}",
+            (
+                record["date"].strftime("%d %b %Y")
+                if record["date"]
+                else "-"
+            ),
+        ])
+
+    rows.append([
+        "GRAND TOTAL",
+        str(total_invoices),
+        f"Rs.{total_outstanding:.2f}",
+        "",
+    ])
+
+    response = HttpResponse(
+        content_type="application/pdf"
+    )
+
+    response["Content-Disposition"] = (
+        'attachment; filename="Outstanding_Payments.pdf"'
+    )
+
+    return _generate_table_pdf(
+        response,
+        "Customer-wise Outstanding Payments",
+        headers,
+        rows
+    )
+
+
 
 def export_advances_pdf(request):
-    advances = AdvancePayment.objects.select_related('customer').order_by('-created_at')
-    response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = 'attachment; filename="Advances.pdf"'
-    
-    headers = ['Advance ID', 'Customer', 'Amount', 'Date', 'Note']
-    rows = []
-    for a in advances:
-        rows.append([
-            str(a.advance_number),
-            a.customer.customer_name,
-            f"Rs.{float(a.amount):.2f}",
-            a.created_at.strftime("%d %b %Y"),
-            a.note or ""
-        ])
-    return _generate_table_pdf(response, "Customer Advances", headers, rows)
+    if request.method != "GET":
+        return HttpResponse(
+            "GET method required.",
+            status=405
+        )
+
+    sort_by = request.GET.get(
+        "sort_by", "newest"
+    )
+
+    advances = (
+        AdvancePayment.objects
+        .select_related("customer")
+        .order_by("-created_at", "-id")
+    )
+
+    records = []
+
+    for advance in advances:
+        records.append({
+            "customer": advance.customer.customer_name,
+            "date": advance.created_at,
+            "amount": advance.amount,
+            "row": [
+                str(advance.advance_number),
+                advance.customer.customer_name,
+                f"Rs.{advance.amount:.2f}",
+                advance.created_at.strftime(
+                    "%d %b %Y"
+                ),
+                advance.note or "",
+            ],
+        })
+
+    sorted_records = sort_pdf_records(
+        records,
+        sort_by=sort_by,
+    )
+
+    rows = [
+        record["row"]
+        for record in sorted_records
+    ]
+
+    response = HttpResponse(
+        content_type="application/pdf"
+    )
+
+    response["Content-Disposition"] = (
+        'attachment; filename="Advances.pdf"'
+    )
+
+    return _generate_table_pdf(
+        response,
+        "Customer Advances",
+        [
+            "Advance ID",
+            "Customer",
+            "Amount",
+            "Date",
+            "Note",
+        ],
+        rows
+    )
+
+
 
 def export_balances_pdf(request):
+    if request.method != "GET":
+        return HttpResponse(
+            "GET method required.",
+            status=405
+        )
+
+    sort_by = request.GET.get(
+        "sort_by", "high"
+    )
+
     customers = Customer.objects.all()
-    response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = 'attachment; filename="Advance_Balances.pdf"'
-    
-    headers = ['Customer', 'Received', 'Consumed', 'Remaining', 'Utilization']
-    rows = []
-    for c in customers:
-        adv_agg = AdvancePayment.objects.filter(customer=c).aggregate(Sum('amount'))['amount__sum'] or Decimal('0.00')
-        inv_agg = Invoice.objects.filter(order__customer=c).aggregate(Sum('advance_used'))['advance_used__sum'] or Decimal('0.00')
-        balance = adv_agg - inv_agg
-        if adv_agg > 0:
-            percent = (inv_agg / adv_agg) * Decimal('100.00')
-            rows.append([
-                c.customer_name,
-                f"Rs.{float(adv_agg):.2f}",
-                f"Rs.{float(inv_agg):.2f}",
-                f"Rs.{float(balance):.2f}",
-                f"{float(percent):.1f}%"
-            ])
-    return _generate_table_pdf(response, "Advance Balances", headers, rows)
+
+    records = []
+
+    for customer in customers:
+        received = (
+            AdvancePayment.objects
+            .filter(customer=customer)
+            .aggregate(Sum("amount"))["amount__sum"]
+            or Decimal("0.00")
+        )
+
+        consumed = (
+            Invoice.objects
+            .filter(order__customer=customer)
+            .aggregate(Sum("advance_used"))[
+                "advance_used__sum"
+            ]
+            or Decimal("0.00")
+        )
+
+        if received <= Decimal("0.00"):
+            continue
+
+        remaining = received - consumed
+
+        utilization = (
+            consumed / received
+        ) * Decimal("100.00")
+
+        latest_advance = (
+            AdvancePayment.objects
+            .filter(customer=customer)
+            .order_by("-created_at")
+            .first()
+        )
+
+        records.append({
+            "customer": customer.customer_name,
+            "date": (
+                latest_advance.created_at
+                if latest_advance
+                else None
+            ),
+            "amount": remaining,
+            "row": [
+                customer.customer_name,
+                f"Rs.{received:.2f}",
+                f"Rs.{consumed:.2f}",
+                f"Rs.{remaining:.2f}",
+                f"{utilization:.1f}%",
+            ],
+        })
+
+    sorted_records = sort_pdf_records(
+        records,
+        sort_by=sort_by,
+    )
+
+    rows = [
+        record["row"]
+        for record in sorted_records
+    ]
+
+    response = HttpResponse(
+        content_type="application/pdf"
+    )
+
+    response["Content-Disposition"] = (
+        'attachment; filename="Advance_Balances.pdf"'
+    )
+
+    return _generate_table_pdf(
+        response,
+        "Advance Balances",
+        [
+            "Customer",
+            "Received",
+            "Consumed",
+            "Remaining",
+            "Utilization",
+        ],
+        rows
+    )
+
+
 
 def export_sales_report_pdf(request):
-    invoices = Invoice.objects.select_related('order', 'order__customer').order_by('-created_at')
-    response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = 'attachment; filename="Sales_Report.pdf"'
-    
-    headers = ['Invoice No', 'Customer', 'Date', 'Amount', 'Status']
-    rows = []
-    for inv in invoices:
-        rows.append([
-            str(inv.invoice_number),
-            inv.order.customer.customer_name,
-            inv.created_at.strftime("%d %b %Y"),
-            f"Rs.{float(inv.total_amount):.2f}",
-            inv.status
-        ])
-    return _generate_table_pdf(response, "Sales Report", headers, rows)
+    if request.method != "GET":
+        return HttpResponse(
+            "GET method required.",
+            status=405
+        )
+
+    sort_by = request.GET.get(
+        "sort_by", "newest"
+    )
+
+    invoices = (
+        Invoice.objects
+        .select_related(
+            "order",
+            "order__customer"
+        )
+        .order_by("-created_at", "-id")
+    )
+
+    records = []
+
+    for invoice in invoices:
+        records.append({
+            "customer": (
+                invoice.order.customer.customer_name
+            ),
+            "date": invoice.created_at,
+            "amount": invoice.total_amount,
+            "row": [
+                str(invoice.invoice_number),
+                invoice.order.customer.customer_name,
+                invoice.created_at.strftime(
+                    "%d %b %Y"
+                ),
+                f"Rs.{invoice.total_amount:.2f}",
+                invoice.status,
+            ],
+        })
+
+    sorted_records = sort_pdf_records(
+        records,
+        sort_by=sort_by,
+    )
+
+    rows = [
+        record["row"]
+        for record in sorted_records
+    ]
+
+    response = HttpResponse(
+        content_type="application/pdf"
+    )
+
+    response["Content-Disposition"] = (
+        'attachment; filename="Sales_Report.pdf"'
+    )
+
+    return _generate_table_pdf(
+        response,
+        "Sales Report",
+        [
+            "Invoice No",
+            "Customer",
+            "Date",
+            "Amount",
+            "Status",
+        ],
+        rows
+    )
+
+
 
 def export_purchase_orders_pdf(request):
-    orders = Order.objects.select_related('customer').filter(status='Ready').order_by('-created_at')
-    response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = 'attachment; filename="Purchase_Orders.pdf"'
-    
-    headers = ['Order No', 'Customer', 'Items', 'Total Weight (Kg)', 'Status']
-    rows = []
-    for o in orders:
-        items_summary = " + ".join([i.chicken_type for i in o.items.all()])
-        rows.append([
-            str(o.order_number),
-            o.customer.customer_name,
-            items_summary or "-",
-            f"{float(o.total_weight):.2f}",
-            o.status
-        ])
-    return _generate_table_pdf(response, "Pending Purchase Orders", headers, rows)
+    if request.method != "GET":
+        return HttpResponse(
+            "GET method required.",
+            status=405
+        )
+
+    sort_by = request.GET.get(
+        "sort_by", "newest"
+    )
+
+    orders = (
+        Order.objects
+        .select_related("customer")
+        .prefetch_related("items")
+        .filter(status="Ready")
+        .order_by("-created_at", "-id")
+    )
+
+    records = []
+
+
+    for order in orders:
+        order_items = list(order.items.all())
+
+        items_summary = " + ".join(
+            str(item.chicken_type)
+            for item in order_items
+        )
+
+        # Calculate total weight from OrderItem records
+        total_weight = sum(
+            (
+                Decimal(str(item.weight or 0))
+                for item in order_items
+            ),
+            Decimal("0.00")
+        )
+
+        records.append({
+            "customer": order.customer.customer_name,
+            "date": order.created_at,
+            "amount": None,
+            "row": [
+                str(order.order_number),
+                order.customer.customer_name,
+                items_summary or "-",
+                f"{total_weight:.2f}",
+                order.status,
+            ],
+        })
+
+    # Amount sorting is not meaningful for Orders.
+    if sort_by in ("high", "low"):
+        sort_by = "newest"
+
+    sorted_records = sort_pdf_records(
+        records,
+        sort_by=sort_by,
+    )
+
+    rows = [
+        record["row"]
+        for record in sorted_records
+    ]
+
+    response = HttpResponse(
+        content_type="application/pdf"
+    )
+
+    response["Content-Disposition"] = (
+        'attachment; filename="Purchase_Orders.pdf"'
+    )
+
+    return _generate_table_pdf(
+        response,
+        "Pending Purchase Orders",
+        [
+            "Order No",
+            "Customer",
+            "Items",
+            "Total Weight (Kg)",
+            "Status",
+        ],
+        rows
+    )
+
 
 @csrf_exempt
 def save_order_pricing(request, order_id):
@@ -1855,3 +2343,320 @@ def save_order_pricing(request, order_id):
         return JsonResponse({"success": False, "message": "Order not found."}, status=404)
     except Exception as e:
         return JsonResponse({"success": False, "message": str(e)}, status=400)
+
+
+
+# ==========================================================
+# CUSTOMER-WISE OUTSTANDING PAYMENT
+# ==========================================================
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([
+    IsAuthenticated,
+    CanManageCustomerPayments,
+])
+def get_customer_outstanding(request):
+    """
+    Return all pending invoices, grouped customer-wise.
+
+    Intentionally does not filter by date, because
+    a customer may have unpaid invoices from many days.
+    """
+
+    invoices = (
+        Invoice.objects
+        .select_related("order", "order__customer")
+        .exclude(status="Paid")
+        .order_by(
+            "order__customer_id",
+            "order__delivery_date",
+            "id"
+        )
+    )
+
+    customers = {}
+    total_outstanding = Decimal("0.00")
+    total_pending_invoices = 0
+
+    for invoice in invoices:
+        balance = invoice.remaining_amount
+
+        if balance <= Decimal("0.00"):
+            continue
+
+        customer = invoice.order.customer
+        customer_id = customer.id
+
+        if customer_id not in customers:
+            customers[customer_id] = {
+                "customer_id": customer_id,
+                "customer": customer.customer_name,
+                "company": customer.company_name,
+                "total_outstanding": Decimal("0.00"),
+                "invoice_count": 0,
+                "invoices": [],
+            }
+
+        group = customers[customer_id]
+
+        group["total_outstanding"] += balance
+        group["invoice_count"] += 1
+
+        group["invoices"].append({
+            "id": invoice.invoice_number,
+            "invoice_id": invoice.id,
+            "customer": customer.customer_name,
+            "due_date": invoice.order.delivery_date.strftime(
+                "%d %b %Y"
+            ),
+            "delivery_date": invoice.order.delivery_date.isoformat(),
+            "total": float(invoice.total_amount),
+            "advance": float(invoice.advance_used),
+            "balance": float(balance),
+            "status": invoice.status,
+        })
+
+        total_outstanding += balance
+        total_pending_invoices += 1
+
+    result = []
+
+    for group in customers.values():
+        group["total_outstanding"] = float(
+            group["total_outstanding"]
+        )
+
+        result.append(group)
+
+    result.sort(
+        key=lambda c: c["total_outstanding"],
+        reverse=True
+    )
+
+    return JsonResponse({
+        "success": True,
+        "customers": result,
+        "stats": {
+            "total_outstanding": float(total_outstanding),
+            "pending_customers": len(result),
+            "pending_invoices": total_pending_invoices,
+        },
+    })
+
+
+# ==========================================================
+# RECORD ONE PAYMENT AGAINST MULTIPLE INVOICES
+# ==========================================================
+
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([
+    IsAuthenticated,
+    CanManageCustomerPayments,
+])
+def record_customer_bulk_payment(request, customer_id):
+    """
+    Allocate a single customer payment across all pending
+    invoices, oldest delivery date first.
+
+    Uses row locks and a database transaction to prevent
+    concurrent overpayments and partial saves.
+    """
+
+    data = request.data
+
+    amount_raw = data.get("amount")
+    payment_method = data.get(
+        "payment_method",
+        "Cash"
+    )
+
+    reference_no = str(
+        data.get("reference_no") or ""
+    ).strip()
+
+    note = str(
+        data.get("note") or ""
+    ).strip()
+
+    if amount_raw is None:
+        return JsonResponse({
+            "success": False,
+            "message": "Payment amount is required."
+        }, status=400)
+
+    try:
+        amount = Decimal(str(amount_raw))
+
+        if not amount.is_finite():
+            raise InvalidOperation
+
+        if amount <= 0:
+            return JsonResponse({
+                "success": False,
+                "message": "Payment must be greater than zero."
+            }, status=400)
+
+        if amount.as_tuple().exponent < -2:
+            return JsonResponse({
+                "success": False,
+                "message": "Only two decimal places are allowed."
+            }, status=400)
+
+        amount = amount.quantize(Decimal("0.01"))
+
+    except (InvalidOperation, ValueError, TypeError):
+        return JsonResponse({
+            "success": False,
+            "message": "Invalid payment amount."
+        }, status=400)
+
+    allowed_methods = {
+        "Cash",
+        "UPI",
+        "Bank Transfer",
+        "Cheque",
+    }
+
+    if payment_method not in allowed_methods:
+        return JsonResponse({
+            "success": False,
+            "message": "Invalid payment method."
+        }, status=400)
+
+    if len(reference_no) > 100:
+        return JsonResponse({
+            "success": False,
+            "message": "Reference number is too long."
+        }, status=400)
+
+    try:
+        with transaction.atomic():
+
+            # Lock customer first to serialize customer-wise
+            # payments made through this endpoint.
+            customer = (
+                Customer.objects
+                .select_for_update()
+                .get(pk=customer_id)
+            )
+
+            # Lock all invoices for this customer,
+            # consistently ordered by primary key.
+            locked_invoices = list(
+                Invoice.objects
+                .select_for_update()
+                .filter(order__customer_id=customer.id)
+                .order_by("id")
+            )
+
+            pending = []
+
+            for invoice in locked_invoices:
+                balance = invoice.remaining_amount
+
+                if balance > Decimal("0.00"):
+                    pending.append({
+                        "invoice": invoice,
+                        "balance": balance,
+                    })
+
+            # Oldest invoice first, using delivery date.
+            pending.sort(
+                key=lambda entry: (
+                    entry["invoice"].order.delivery_date,
+                    entry["invoice"].id,
+                )
+            )
+
+            total_due = sum(
+                (
+                    entry["balance"]
+                    for entry in pending
+                ),
+                Decimal("0.00")
+            )
+
+            if total_due <= 0:
+                return JsonResponse({
+                    "success": False,
+                    "message": "No pending invoices for this customer."
+                }, status=400)
+
+            if amount > total_due:
+                return JsonResponse({
+                    "success": False,
+                    "message": (
+                        f"Payment exceeds customer outstanding "
+                        f"amount of ₹{total_due:.2f}."
+                    )
+                }, status=400)
+
+            remaining_payment = amount
+            allocations = []
+
+            for entry in pending:
+                if remaining_payment <= 0:
+                    break
+
+                invoice = entry["invoice"]
+                invoice_balance = entry["balance"]
+
+                allocated = min(
+                    remaining_payment,
+                    invoice_balance
+                )
+
+                payment = InvoicePayment.objects.create(
+                    invoice=invoice,
+                    amount=allocated,
+                    payment_method=payment_method,
+                    reference_no=reference_no,
+                    note=note,
+                )
+
+                invoice.update_status()
+
+                allocations.append({
+                    "invoice_id": invoice.id,
+                    "invoice_number": invoice.invoice_number,
+                    "payment_id": payment.id,
+                    "paid": float(allocated),
+                    "new_balance": float(
+                        invoice.remaining_amount
+                    ),
+                    "new_status": invoice.status,
+                })
+
+                remaining_payment -= allocated
+
+            return JsonResponse({
+                "success": True,
+                "message": "Customer payment recorded successfully.",
+                "customer_id": customer.id,
+                "customer": customer.customer_name,
+                "total_paid": float(amount),
+                "remaining_outstanding": float(
+                    total_due - amount
+                ),
+                "allocations": allocations,
+            })
+
+    except Customer.DoesNotExist:
+        return JsonResponse({
+            "success": False,
+            "message": "Customer not found."
+        }, status=404)
+
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Customer bulk payment failed"
+        )
+
+        return JsonResponse({
+            "success": False,
+            "message": "Unable to record payment."
+        }, status=500)
