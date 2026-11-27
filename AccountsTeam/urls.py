@@ -42,5 +42,8 @@ urlpatterns = [
     path("outstanding/customers/",views.get_customer_outstanding,name="accounts_customer_outstanding"),
     # Customer-wise bulk payment
     path("outstanding/customers/<int:customer_id>/pay/",views.record_customer_bulk_payment,name="accounts_customer_bulk_payment"),
+    path('reports/balance-details/', views.get_balance_amount_report, name='accounts_balance_amount_report'),
+    path('reports/balance-details/pdf/', views.export_balance_amount_report_pdf, name='export_balance_amount_report_pdf'),
+    path("reports/balance-details/",views.get_balance_amount_report,name="accounts_balance_amount_report"),
 
 ]

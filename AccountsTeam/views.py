@@ -1424,15 +1424,17 @@ def get_sales_report(request):
         customer_code = str(customer.id)
 
         sales_list.append({
+            "id": inv.id,  # Numeric invoice database ID
             "invoice_no": inv.invoice_number,
+            "customer_id": customer.id,
             "customer": customer.customer_name,
+            "created_at": inv.created_at.isoformat(),
             "date": inv.created_at.strftime(
                 "%d %b %Y, %I:%M %p"
             ),
             "amount": float(inv.total_amount),
-            "status": inv.status
+            "status": inv.status,
         })
-
         group = customer_groups[customer.id]
 
         group["customer_code"] = customer_code
@@ -2660,3 +2662,406 @@ def record_customer_bulk_payment(request, customer_id):
             "success": False,
             "message": "Unable to record payment."
         }, status=500)
+
+
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from collections import defaultdict
+from decimal import Decimal
+from django.utils.dateparse import parse_date
+from django.db.models import Q
+from Admin.models import Invoice
+
+def get_balance_amount_report(request):
+    if request.method != "GET":
+        return JsonResponse({"success": False, "message": "GET method required."}, status=405)
+
+    start_date = request.GET.get("start_date")
+    end_date = request.GET.get("end_date")
+    period = request.GET.get("period", "Daily")
+
+    invoices = Invoice.objects.select_related("order__customer").all().order_by("order__customer__name")
+
+    if start_date:
+        invoices = invoices.filter(created_at__date__gte=parse_date(start_date))
+    if end_date:
+        invoices = invoices.filter(created_at__date__lte=parse_date(end_date))
+
+    customer_map = defaultdict(lambda: {
+        "customer_id": None,
+        "customer_name": "",
+        "phone_number": "",
+        "invoice_count": 0,
+        "total_invoiced": Decimal("0.00"),
+        "total_paid": Decimal("0.00"),
+        "total_balance": Decimal("0.00"),
+    })
+
+    for invoice in invoices:
+        customer = getattr(invoice.order, "customer", None)
+        if not customer:
+            continue
+
+        key = customer.id
+        row = customer_map[key]
+
+        row["customer_id"] = customer.id
+        row["customer_name"] = customer.name
+        row["phone_number"] = getattr(customer, "phone", "") or getattr(customer, "mobile", "") or ""
+        row["invoice_count"] += 1
+        row["total_invoiced"] += Decimal(str(invoice.total_amount or 0))
+        row["total_paid"] += Decimal(str(getattr(invoice, "paid_amount", 0) or 0))
+        row["total_balance"] += Decimal(str(getattr(invoice, "balance_amount", 0) or 0))
+
+    results = []
+    for row in customer_map.values():
+        if row["total_balance"] <= 0:
+            status = "Paid"
+        elif row["total_paid"] <= 0:
+            status = "Unpaid"
+        else:
+            status = "Partial"
+
+        results.append({
+            "customer_id": row["customer_id"],
+            "customer_name": row["customer_name"],
+            "phone_number": row["phone_number"],
+            "invoice_count": row["invoice_count"],
+            "total_invoiced": float(row["total_invoiced"]),
+            "total_paid": float(row["total_paid"]),
+            "total_balance": float(row["total_balance"]),
+            "status": status,
+        })
+
+    grand_total_invoiced = sum(item["total_invoiced"] for item in results)
+    grand_total_paid = sum(item["total_paid"] for item in results)
+    grand_total_balance = sum(item["total_balance"] for item in results)
+
+    return JsonResponse({
+        "success": True,
+        "period": period,
+        "results": results,
+        "summary": {
+            "total_customers": len(results),
+            "total_invoiced": grand_total_invoiced,
+            "total_paid": grand_total_paid,
+            "total_balance": grand_total_balance,
+        }
+    })
+
+
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
+def export_balance_amount_report_pdf(request):
+    report_response = get_balance_amount_report(request)
+    data = json.loads(report_response.content.decode("utf-8"))
+
+    response = HttpResponse(content_type="application/pdf")
+    response["Content-Disposition"] = 'attachment; filename="Balance_Amount_Report.pdf"'
+
+    doc = SimpleDocTemplate(response, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("Balance Amount Details Report", styles["Title"]))
+    story.append(Spacer(1, 12))
+
+    table_data = [[
+        "Customer Name",
+        "Phone Number",
+        "Invoice Count",
+        "Total Invoiced",
+        "Total Paid",
+        "Total Balance",
+        "Status"
+    ]]
+
+    for row in data.get("results", []):
+        table_data.append([
+            row["customer_name"],
+            row["phone_number"],
+            str(row["invoice_count"]),
+            f'Rs. {row["total_invoiced"]:.2f}',
+            f'Rs. {row["total_paid"]:.2f}',
+            f'Rs. {row["total_balance"]:.2f}',
+            row["status"],
+        ])
+
+    summary = data.get("summary", {})
+    table_data.append([
+        "TOTAL",
+        "",
+        str(summary.get("total_customers", 0)),
+        f'Rs. {summary.get("total_invoiced", 0):.2f}',
+        f'Rs. {summary.get("total_paid", 0):.2f}',
+        f'Rs. {summary.get("total_balance", 0):.2f}',
+        "",
+    ])
+
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4B5EAA")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#DCE6F8")),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+
+    story.append(table)
+    doc.build(story)
+    return response
+
+
+
+
+from django.utils.dateparse import parse_date
+from django.db.models import Sum
+from django.utils import timezone
+from datetime import timedelta
+from decimal import Decimal
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([
+    IsAuthenticated,
+    CanManageCustomerPayments,
+])
+def get_balance_amount_report(request):
+    """
+    Customer-wise balance details.
+
+    Invoiced = sum of invoice totals
+    Paid = advance used + direct invoice payments
+    Balance = invoiced - paid
+
+    Date filters select invoices by creation date.
+    Payments represent their current recorded state.
+    """
+
+    period = request.GET.get("period", "All")
+    from_date_str = request.GET.get("from_date")
+    to_date_str = request.GET.get("to_date")
+
+    allowed_periods = {
+        "All",
+        "Daily",
+        "Weekly",
+        "Monthly",
+    }
+
+    if period not in allowed_periods:
+        return JsonResponse({
+            "success": False,
+            "message": "Invalid report period."
+        }, status=400)
+
+    if bool(from_date_str) != bool(to_date_str):
+        return JsonResponse({
+            "success": False,
+            "message": "Both dates are required."
+        }, status=400)
+
+    zero = Decimal("0.00")
+    today = timezone.localdate()
+
+    invoices = (
+        Invoice.objects
+        .select_related(
+            "order",
+            "order__customer",
+        )
+        .annotate(
+            direct_paid=Sum("payments__amount")
+        )
+        .order_by(
+            "order__customer__customer_name",
+            "id",
+        )
+    )
+
+    if from_date_str and to_date_str:
+        from_date = parse_date(from_date_str)
+        to_date = parse_date(to_date_str)
+
+        if not from_date or not to_date:
+            return JsonResponse({
+                "success": False,
+                "message": "Invalid date format. Use YYYY-MM-DD."
+            }, status=400)
+
+        if from_date > to_date:
+            return JsonResponse({
+                "success": False,
+                "message": "From Date cannot exceed To Date."
+            }, status=400)
+
+        invoices = invoices.filter(
+            created_at__date__range=(
+                from_date,
+                to_date,
+            )
+        )
+
+    elif period == "Daily":
+        invoices = invoices.filter(
+            created_at__date=today
+        )
+
+    elif period == "Weekly":
+        week_start = today - timedelta(
+            days=today.weekday()
+        )
+
+        invoices = invoices.filter(
+            created_at__date__range=(
+                week_start,
+                today,
+            )
+        )
+
+    elif period == "Monthly":
+        month_start = today.replace(day=1)
+
+        invoices = invoices.filter(
+            created_at__date__range=(
+                month_start,
+                today,
+            )
+        )
+
+    customer_map = {}
+
+    for invoice in invoices:
+        customer = invoice.order.customer
+
+        if customer.id not in customer_map:
+            customer_map[customer.id] = {
+                "customer_id": customer.id,
+                "customer_name": customer.customer_name,
+                "phone_number": customer.phone or "",
+                "invoice_count": 0,
+                "total_invoiced": zero,
+                "total_paid": zero,
+                "total_balance": zero,
+                "last_invoice_date": None,
+            }
+
+        row = customer_map[customer.id]
+
+        invoiced = (
+            invoice.total_amount or zero
+        )
+
+        advance_used = (
+            invoice.advance_used or zero
+        )
+
+        direct_paid = (
+            invoice.direct_paid or zero
+        )
+
+        # Never record an amount greater than the
+        # invoice total as settled for reporting.
+        paid = min(
+            invoiced,
+            max(zero, advance_used + direct_paid)
+        )
+
+        balance = max(
+            zero,
+            invoiced - paid
+        )
+
+        row["invoice_count"] += 1
+        row["total_invoiced"] += invoiced
+        row["total_paid"] += paid
+        row["total_balance"] += balance
+
+        created_date = timezone.localdate(
+            invoice.created_at
+        )
+
+        if (
+            row["last_invoice_date"] is None
+            or created_date > row["last_invoice_date"]
+        ):
+            row["last_invoice_date"] = created_date
+
+    results = []
+
+    for row in customer_map.values():
+        paid = row["total_paid"]
+        balance = row["total_balance"]
+
+        if balance <= zero:
+            status = "Paid"
+        elif paid > zero:
+            status = "Partial"
+        else:
+            status = "Unpaid"
+
+        results.append({
+            "customer_id": row["customer_id"],
+            "customer_name": row["customer_name"],
+            "phone_number": row["phone_number"],
+            "invoice_count": row["invoice_count"],
+            "total_invoiced": float(
+                row["total_invoiced"]
+            ),
+            "total_paid": float(
+                row["total_paid"]
+            ),
+            "total_balance": float(
+                row["total_balance"]
+            ),
+            "last_invoice_date": (
+                row["last_invoice_date"].isoformat()
+                if row["last_invoice_date"]
+                else None
+            ),
+            "status": status,
+        })
+
+    results.sort(
+        key=lambda item: item["customer_name"].casefold()
+    )
+
+    summary = {
+        "total_customers": len(results),
+        "total_invoices": sum(
+            row["invoice_count"]
+            for row in results
+        ),
+        "total_invoiced": round(
+            sum(
+                row["total_invoiced"]
+                for row in results
+            ), 2
+        ),
+        "total_paid": round(
+            sum(
+                row["total_paid"]
+                for row in results
+            ), 2
+        ),
+        "total_balance": round(
+            sum(
+                row["total_balance"]
+                for row in results
+            ), 2
+        ),
+    }
+
+    return JsonResponse({
+        "success": True,
+        "period": period,
+        "results": results,
+        "summary": summary,
+    })
